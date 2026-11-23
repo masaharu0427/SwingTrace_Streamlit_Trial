@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.7.1+cpu; platform_system != "Darwin"
+torchvision==0.22.1+cpu; platform_system != "Darwin"
+torch==2.7.1; platform_system == "Darwin"
+torchvision==0.22.1; platform_system == "Darwin"
+streamlit==1.52.2
+ultralytics==8.3.225
+opencv-python==4.11.0.86
+imageio-ffmpeg==0.6.0
+numpy>=1.26,<3

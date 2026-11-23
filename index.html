@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>修正するクラブヘッドの位置</title>
+<style>
+  html, body { margin: 0; }
+  #frame { position: relative; margin: 0 auto; width: 100%; line-height: 0; }
+  img { display: block; width: 100%; cursor: crosshair; touch-action: manipulation;
+        user-select: none; border-radius: 7px; }
+</style>
+<div id="frame"><img id="photo" alt="スイング動画の確認コマ" draggable="false"></div>
+<script>
+  const photo = document.getElementById("photo");
+  const frame = document.getElementById("frame");
+  let token = null;
+  let ready = false;
+  const send = (type, fields = {}) =>
+    window.parent.postMessage({ isStreamlitMessage: true, type, ...fields }, "*");
+  const resize = () => send("streamlit:setFrameHeight", {
+    height: Math.ceil(frame.getBoundingClientRect().height) + 1
+  });
+
+  window.addEventListener("message", ({ source, data }) => {
+    if (source !== window.parent || data?.type !== "streamlit:render") return;
+    const args = data.args;
+    const url = "data:image/jpeg;base64," + args.image;
+    if (token !== args.token || photo.getAttribute("src") !== url) {
+      ready = false;
+      token = args.token;
+      frame.style.maxWidth = Math.round(Math.min(960, 720 * args.aspect)) + "px";
+      photo.style.aspectRatio = args.aspect;
+      photo.src = url;
+      ready = photo.complete && photo.naturalWidth > 0;
+    }
+    resize();
+  });
+  photo.addEventListener("load", () => { ready = true; resize(); });
+  photo.addEventListener("click", event => {
+    if (!ready || token === null) return;
+    const bounds = photo.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return;
+    const unit = value => Math.max(0, Math.min(1, value));
+    send("streamlit:setComponentValue", {
+      dataType: "json",
+      value: {
+        token, id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+        x: unit((event.clientX - bounds.left) / bounds.width),
+        y: unit((event.clientY - bounds.top) / bounds.height)
+      }
+    });
+  });
+  new ResizeObserver(resize).observe(frame);
+  send("streamlit:componentReady", { apiVersion: 1 });
+  resize();
+</script>
+</html>
