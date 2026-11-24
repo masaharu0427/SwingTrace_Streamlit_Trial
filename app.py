@@ -10,6 +10,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from tracking import Detector, estimate_path
+from trajectory import estimate_timing, smooth_path
 from video_io import MAX_FRAMES, MAX_SECONDS, analyze, export_video, normalize, preview_jpeg
 
 st.set_page_config(page_title="SwingTrace クラブヘッド追跡", page_icon="⛳", layout="wide")
@@ -131,7 +132,8 @@ def start_job(upload, image_size: int):
         raise
     return {
         "id": uuid4().hex, "temp": job_dir, "source": source, "info": info,
-        "detections": detections, "corrections": {}, "export": None, "click": None,
+        "detections": detections, "image_size": image_size,
+        "corrections": {}, "split": None, "end": None, "export": None, "click": None,
         "filename": f"{Path(upload.name).stem}_swingtrace.mp4",
     }
 
@@ -155,9 +157,10 @@ with st.container():
     st.subheader("動画を選択")
     upload = st.file_uploader("スイング動画", type=["mp4", "mov", "m4v"], label_visibility="collapsed")
     st.caption(f"1人・1スイング。上限100 MB、{MAX_SECONDS}秒、{MAX_FRAMES:,}コマ。")
-    image_size = st.radio("追跡モード", [640, 480], format_func=lambda size: {
-        640: "標準（小さなヘッドを優先）", 480: "高速（まず試したいとき）",
+    image_size = st.radio("追跡モード", [896, 640, 480], format_func=lambda size: {
+        896: "高精度（未検出のコマを再解析）", 640: "標準", 480: "高速",
     }[size], horizontal=True)
+    st.caption("高精度モードは処理に時間がかかります。まずは短いスイング動画でお試しください。")
     loaded = st.session_state.get("job")
     if st.button("自動追跡する", disabled=upload is None, type="primary"):
         try:
@@ -176,6 +179,13 @@ if job is None:
 
 info = job["info"]
 path = estimate_path(job["detections"], job["corrections"], info.fps, info.width, info.height)
+render_path = smooth_path(path, info.fps, info.width, info.height)
+suggestion = estimate_timing(render_path, info.fps, info.height)
+end = job.get("end")
+end = suggestion.end if end is None else end
+split = job.get("split")
+split = suggestion.split if split is None else split
+split = split if split is not None and split <= end else None
 suspects = [i for i, sample in enumerate(path) if sample.suspect]
 manual_count = sum(sample.source == "manual" for sample in path)
 frame_key = f"frame_{job['id']}"
@@ -184,8 +194,13 @@ current = path[index]
 st.divider()
 st.subheader("コマを確認・修正")
 st.caption(f"{job['filename']} · {info.frames:,}コマ · {info.fps:g} fps · 要確認 {len(suspects):,} · 手動修正 {manual_count:,}")
+direct = sum(sample.source == "head" for sample in path)
+estimated = sum(sample.source in ("shaft", "interpolated") for sample in path)
+missing = sum(sample.source == "missing" for sample in path)
+st.caption(f"ヘッド直接検出 {direct:,} · シャフト推定・補間 {estimated:,} · 未検出 {missing:,}")
 if all(sample.point is None for sample in path):
-    st.warning("クラブヘッドを検出できませんでした。別の動画や標準モードを試すか、見えるコマをクリックして位置を追加できます。")
+    hint = ("高精度モードで再解析するか、" if job.get("image_size", 640) < 896 else "")
+    st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
 
 previous = next((i for i in reversed(suspects) if i < index), None)
 following = next((i for i in suspects if i > index), None)
@@ -200,7 +215,7 @@ if info.frames > 1:
     st.slider("コマ番号", 1, info.frames, key=frame_key)
 st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[current.source]}"
            + ("（要確認）" if current.suspect else ""))
-st.write("画像上のクラブヘッドの中心をクリックすると、このコマの位置を修正できます。")
+st.write("画像上のクラブヘッドの中心をクリックして修正します。短い検出漏れは、前後の見えるコマをクリックすると補間できます。")
 
 controls = st.columns(3)
 show_trail = controls[0].checkbox("確認画像に軌道を表示", value=True)
@@ -212,8 +227,41 @@ if controls[2].button("このコマの修正を戻す", disabled=index not in jo
     invalidate_export(job)
     st.rerun()
 
+st.subheader("軌道の色と描画範囲")
+if split is None:
+    st.caption("切り替え点を指定すると、そこまでが青、その後が赤になります。")
+else:
+    st.caption(f"青 → 赤　{split + 1:,}コマ目（{split / info.fps:.2f}秒）"
+               f"{' ・ 自動候補' if job.get('split') is None else ''}")
+end_label = ""
+if job.get("end") is None:
+    end_label = " ・ 自動候補" if suggestion.occlusion_found else " ・ 最後の検出点"
+st.caption(f"描画終了　{end + 1:,}コマ目（{end / info.fps:.2f}秒）{end_label}")
+timing = st.columns(3)
+if timing[0].button("このコマで青 → 赤", disabled=index >= end, width="stretch"):
+    job["split"] = index
+    invalidate_export(job)
+    st.rerun()
+if timing[1].button("このコマで描画終了", disabled=current.point is None, width="stretch"):
+    job["end"] = index
+    invalidate_export(job)
+    st.rerun()
+if timing[2].button("色と終了を自動に戻す",
+                    disabled=job.get("split") is None and job.get("end") is None, width="stretch"):
+    job["split"] = None
+    job["end"] = None
+    invalidate_export(job)
+    st.rerun()
+seek_controls = st.columns(2)
+if split is not None:
+    seek_controls[0].button("色の切り替えを確認", on_click=move_to,
+                            args=(frame_key, split + 1), width="stretch")
+seek_controls[1].button("終了点を確認", on_click=move_to,
+                        args=(frame_key, end + 1), width="stretch")
+
 try:
-    jpeg = preview_jpeg(job["source"], path, index, show_trail)
+    jpeg = preview_jpeg(job["source"], render_path, index, show_trail,
+                        split=split, end=end, review_sample=current)
 except RuntimeError as error:
     st.error(str(error))
     st.stop()
@@ -232,14 +280,15 @@ if event and event.get("token") == token and event.get("id") != job["click"]:
 
 st.divider()
 st.subheader("軌道付き動画")
-st.caption("クラブヘッドの通過位置を緑の軌道で重ねます。元動画に音声がある場合は音声も入ります。")
-if st.button("軌道付きMP4を作成", type="primary", disabled=all(p.point is None for p in path)):
+st.caption("描画終了後も、それまでの軌道を残した状態で動画が最後まで再生されます。")
+if st.button("軌道付きMP4を作成", type="primary", disabled=all(p.point is None for p in render_path[:end + 1])):
     target = job["source"].with_name("swingtrace.mp4")
     progress = st.progress(0, text="軌道付き動画を書き出しています…")
     try:
         export_video(
-            job["source"], info, path, target,
+            job["source"], info, render_path, target,
             lambda done, total: progress.progress(done / total, text=f"MP4作成中 · {done:,} / {total:,} コマ"),
+            split=split, end=end,
         )
         job["export"] = target
     except Exception as error:

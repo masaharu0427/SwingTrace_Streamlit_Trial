@@ -12,11 +12,13 @@ import imageio_ffmpeg
 import numpy as np
 
 from tracking import Sample
+from trajectory import curve_segments
 
 MAX_SECONDS = 30
 MAX_FRAMES = 1800
 WINDOWS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-LINE_COLOR = (70, 255, 85)
+BLUE = (255, 126, 18)
+RED = (36, 48, 255)
 
 
 @dataclass(frozen=True)
@@ -95,37 +97,50 @@ def read_frame(path: Path, index: int) -> np.ndarray:
     return frame
 
 
-def extend_trail(mask: np.ndarray, path: list[Sample], index: int, thickness: int) -> None:
-    point = path[index].point
-    previous = path[index - 1].point if index else None
-    if point is not None and previous is not None:
-        cv2.line(mask, previous, point, 255, thickness, cv2.LINE_AA)
+class Trail:
+    def __init__(self, path: list[Sample], width: int, height: int, split: int | None, end: int):
+        self.split = split
+        self.end = end
+        self.thickness = max(2, round(min(height, width) / 270))
+        self.blue = np.zeros((height, width), dtype=np.uint8)
+        self.red = np.zeros_like(self.blue)
+        self.curves = curve_segments(path, end, width, height)
+
+    def color(self, index: int) -> tuple[int, int, int]:
+        return RED if self.split is not None and index > self.split else BLUE
+
+    def extend(self, index: int) -> None:
+        vertices = self.curves.get(index)
+        if vertices is not None:
+            mask = self.red if self.color(index) == RED else self.blue
+            cv2.polylines(mask, [vertices], False, 255, self.thickness, cv2.LINE_AA, shift=4)
+
+    def composite(self, frame: np.ndarray, sample: Sample, index: int, *, review=False) -> None:
+        for mask, color in ((self.blue, BLUE), (self.red, RED)):
+            indices = np.nonzero(mask)
+            opacity = mask[indices].astype(np.float32)[:, None] / 255.0
+            frame[indices] = frame[indices] * (1 - opacity) + np.asarray(color) * opacity
+        if sample.point is None or index > self.end:
+            return
+        color = self.color(index)
+        if review and sample.source == "manual":
+            color = (255, 220, 40)
+        elif review and sample.suspect:
+            color = (30, 175, 255)
+        radius = self.thickness + 4
+        cv2.circle(frame, sample.point, radius + 1, (15, 15, 15), 3, cv2.LINE_AA)
+        cv2.circle(frame, sample.point, radius, color, 2, cv2.LINE_AA)
 
 
-def composite(frame: np.ndarray, mask: np.ndarray, point, color, thickness: int) -> np.ndarray:
-    indices = np.nonzero(mask)
-    opacity = mask[indices].astype(np.float32)[:, None] / 255.0
-    frame[indices] = frame[indices] * (1 - opacity) + np.array(LINE_COLOR) * opacity
-    if point is not None:
-        radius = thickness + 4
-        cv2.circle(frame, point, radius + 1, (15, 15, 15), 3, cv2.LINE_AA)
-        cv2.circle(frame, point, radius, color, 2, cv2.LINE_AA)
-    return frame
-
-
-def preview_jpeg(source: Path, path: list[Sample], index: int, show_trail: bool) -> bytes:
+def preview_jpeg(source: Path, path: list[Sample], index: int, show_trail: bool,
+                 *, split: int | None, end: int, review_sample: Sample) -> bytes:
     frame = read_frame(source, index)
     height, width = frame.shape[:2]
-    mask = np.zeros((height, width), dtype=np.uint8)
-    thickness = max(2, round(min(height, width) / 270))
+    trail = Trail(path, width, height, split, end)
     if show_trail:
-        for i in range(index + 1):
-            extend_trail(mask, path, i, thickness)
-    sample = path[index]
-    color = (255, 220, 40) if sample.source == "manual" else (
-        (30, 175, 255) if sample.suspect else LINE_COLOR
-    )
-    composite(frame, mask, sample.point, color, thickness)
+        for i in range(1, min(index, end) + 1):
+            trail.extend(i)
+    trail.composite(frame, review_sample, index, review=True)
     ratio = min(1.0, 960 / max(height, width))
     if ratio < 1:
         frame = cv2.resize(frame, (round(width * ratio), round(height * ratio)),
@@ -136,11 +151,11 @@ def preview_jpeg(source: Path, path: list[Sample], index: int, show_trail: bool)
     return jpeg.tobytes()
 
 
-def export_video(source: Path, info: VideoInfo, path: list[Sample], target: Path, progress) -> None:
-    if len(path) != info.frames or not any(sample.point is not None for sample in path):
+def export_video(source: Path, info: VideoInfo, path: list[Sample], target: Path, progress,
+                 *, split: int | None, end: int) -> None:
+    if len(path) != info.frames or not any(sample.point is not None for sample in path[:end + 1]):
         raise RuntimeError("保存できる軌道がありません。")
-    thickness = max(2, round(min(info.height, info.width) / 270))
-    mask = np.zeros((info.height, info.width), dtype=np.uint8)
+    trail = Trail(path, info.width, info.height, split, end)
     temporary = target.with_name("exporting.mp4")
     command = ffmpeg() + [
         "-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{info.width}x{info.height}",
@@ -158,8 +173,8 @@ def export_video(source: Path, info: VideoInfo, path: list[Sample], target: Path
                         ok, frame = capture.read()
                         if not ok:
                             raise RuntimeError("出力中に動画のコマを読み取れませんでした。")
-                        extend_trail(mask, path, index, thickness)
-                        composite(frame, mask, sample.point, LINE_COLOR, thickness)
+                        trail.extend(index)
+                        trail.composite(frame, sample, index)
                         encoder.stdin.write(frame.tobytes())
                         if index % 8 == 0 or index + 1 == info.frames:
                             progress(index + 1, info.frames)

@@ -20,12 +20,16 @@ MODEL_URL = (
 
 HEAD = 1
 SHAFT = 0
+HANDS = 2
+STRONG_HEAD = 0.28
 
 
 @dataclass(frozen=True)
 class Detection:
     head: Point | None
     confidence: float
+    shaft_tip: Point | None = None
+    heads: tuple[tuple[Point, float], ...] = ()
     shafts: tuple[Box, ...] = ()
 
 
@@ -76,25 +80,91 @@ class Detector:
             raise RuntimeError("SwingTraceのクラス構成を確認できません。")
         self.lock = threading.Lock()
 
-    def predict(self, frames: list[np.ndarray], image_size: int) -> list[Detection]:
+    def infer(self, frames: list[np.ndarray], size: int, offset=(0, 0)) -> list[Detection]:
         with self.lock:
             results = self.model.predict(
-                frames, device="cpu", imgsz=image_size, conf=0.24,
-                classes=[HEAD, SHAFT], max_det=12, verbose=False,
+                frames, device="cpu", imgsz=size, conf=0.09,
+                classes=[HEAD, SHAFT, HANDS], max_det=24, verbose=False,
             )
         detections = []
         for result in results:
-            head = None
-            confidence = 0.0
-            shafts = []
+            heads, shafts, hands = [], [], []
+            ox, oy = offset
             for x1, y1, x2, y2, score, label in result.boxes.data.cpu().tolist():
-                if int(label) == HEAD and score > confidence:
-                    head = (round((x1 + x2) / 2), round((y1 + y2) / 2))
-                    confidence = score
-                if int(label) == SHAFT:
-                    shafts.append(tuple(map(round, (x1, y1, x2, y2))))
-            detections.append(Detection(head, confidence, tuple(shafts)))
+                box = (round(x1 + ox), round(y1 + oy), round(x2 + ox), round(y2 + oy))
+                center = (round((x1 + x2) / 2 + ox), round((y1 + y2) / 2 + oy))
+                if int(label) == HEAD:
+                    heads.append((center, score))
+                elif int(label) == SHAFT and score >= 0.30:
+                    shafts.append((box, score))
+                elif int(label) == HANDS and score >= 0.28:
+                    hands.append((center, score))
+            tip = shaft_tip(shafts, hands, float(np.hypot(*result.orig_shape)))
+            detections.append(make_detection(heads, tip, tuple(box for box, _ in shafts)))
         return detections
+
+    def predict(self, frames: list[np.ndarray], image_size: int) -> list[Detection]:
+        base = self.infer(frames, min(640, image_size))
+        if image_size <= 640:
+            return base
+
+        missing = [i for i, detection in enumerate(base) if detection.confidence < STRONG_HEAD]
+        for start in range(0, len(missing), 2):
+            indices = missing[start:start + 2]
+            retry = self.infer([frames[i] for i in indices], image_size)
+            for i, secondary in zip(indices, retry):
+                detected = base[i]
+                tip = secondary.shaft_tip or detected.shaft_tip
+                heads = detected.heads + secondary.heads
+                if tip is not None and max((score for _, score in heads), default=0) < STRONG_HEAD:
+                    frame = frames[i]
+                    height, width = frame.shape[:2]
+                    crop_width = max(1, round(width * 0.52))
+                    crop_height = max(1, round(height * 0.52))
+                    x = min(width - crop_width, max(0, tip[0] - crop_width // 2))
+                    y = min(height - crop_height, max(0, tip[1] - crop_height // 2))
+                    crop = frame[y:y + crop_height, x:x + crop_width]
+                    zoomed = self.infer([crop], 640, (x, y))[0]
+                    radius = 0.10 * float(np.hypot(width, height))
+                    heads += tuple((point, score) for point, score in zoomed.heads
+                                   if distance(point, tip) <= radius)
+                base[i] = make_detection(heads, tip, detected.shafts + secondary.shafts)
+        return base
+
+
+def distance(a: Point, b: Point) -> float:
+    return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+
+def shaft_tip(shafts, hands, diagonal: float) -> Point | None:
+    """The shaft end opposite the detected grip, when both boxes agree."""
+    best = None
+    best_cost = float("inf")
+    for (x1, y1, x2, y2), shaft_confidence in shafts:
+        length = distance((x1, y1), (x2, y2))
+        if not 0.045 * diagonal <= length <= 0.48 * diagonal:
+            continue
+        corners = ((x1, y1), (x1, y2), (x2, y1), (x2, y2))
+        for hand, hand_confidence in hands:
+            ordered = sorted(range(4), key=lambda i: distance(hand, corners[i]))
+            grip, alternate = ordered[:2]
+            error = distance(hand, corners[grip])
+            if error > min(0.055 * diagonal, max(0.018 * diagonal, 0.24 * length)):
+                continue
+            if (distance(hand, corners[alternate]) - error < 0.008 * diagonal
+                    and distance(corners[grip], corners[alternate]) > 0.045 * diagonal):
+                continue
+            cost = error / length - 0.20 * (shaft_confidence + hand_confidence)
+            if cost < best_cost:
+                best = corners[3 - grip]
+                best_cost = cost
+    return best
+
+
+def make_detection(heads, tip: Point | None, shafts: tuple[Box, ...] = ()) -> Detection:
+    candidates = tuple(sorted(heads, key=lambda hit: hit[1], reverse=True)[:8])
+    point, score = candidates[0] if candidates else (None, 0.0)
+    return Detection(point, score, tip, candidates, shafts)
 
 
 def estimate_path(
@@ -104,52 +174,83 @@ def estimate_path(
     def clip(point: Point) -> Point:
         return min(width - 1, max(0, point[0])), min(height - 1, max(0, point[1]))
 
-    def distance(a: Point, b: Point) -> float:
-        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
-
     def interpolate(a: Point, b: Point, ratio: float) -> Point:
         return round(a[0] + (b[0] - a[0]) * ratio), round(a[1] + (b[1] - a[1]) * ratio)
 
-    path = [Sample(clip(d.head), "head", d.confidence < 0.5) if d.head is not None
+    diagonal = float(np.hypot(width, height))
+    path = [Sample(clip(d.head), "head", d.confidence < 0.5)
+            if d.head is not None and d.confidence >= STRONG_HEAD
             else Sample(None, "missing", True) for d in detections]
     for index, point in corrections.items():
         path[index] = Sample(clip(point), "manual") if point is not None else Sample(None, "excluded")
 
-    diagonal = float(np.hypot(width, height))
+    # Discard isolated jumps when the surrounding positions agree.
     for index in range(1, len(path) - 1):
         prev, current, after = path[index - 1:index + 2]
-        if current.source == "head" and all(p.point is not None for p in (prev, after)):
-            step = distance(prev.point, after.point)
-            if distance(current.point, interpolate(prev.point, after.point, 0.5)) > max(
-                0.035 * diagonal, 0.85 * step
-            ):
-                path[index] = Sample(current.point, "head", True)
-
-    # Use nearby head detections or manual points as shaft-end references.
-    # An explicit exclusion breaks the trajectory.
-    anchors = [i for i, s in enumerate(path) if s.point is not None or s.source == "excluded"]
-    shaft_span = max(1, round(fps * 0.16))
-    gap_span = max(1, round(fps * 0.12))
-    for left, right in zip(anchors, anchors[1:]):
-        first, last = path[left].point, path[right].point
-        if first is None or last is None or right - left <= 1 or right - left > shaft_span + 1:
+        if current.source != "head" or prev.point is None or after.point is None:
             continue
-        for index in range(left + 1, right):
-            reference = interpolate(first, last, (index - left) / (right - left))
-            corners = [
-                clip((x, y))
-                for x1, y1, x2, y2 in detections[index].shafts
-                for x, y in ((x1, y1), (x1, y2), (x2, y1), (x2, y2))
-            ]
-            if corners:
-                guess = min(corners, key=lambda point: distance(point, reference))
-                if distance(guess, reference) <= diagonal * 0.08:
-                    path[index] = Sample(guess, "shaft", True)
+        step = distance(prev.point, after.point)
+        offset = distance(current.point, interpolate(prev.point, after.point, 0.5))
+        if offset > max(0.045 * diagonal, 1.15 * step):
+            path[index] = Sample(None, "missing", True)
 
-    anchors = [i for i, s in enumerate(path) if s.point is not None or s.source == "excluded"]
+    anchor_before = None
+    nearby = max(2, round(fps * 0.16))
+    references: list[Point | None] = [None] * len(path)
+    bracketed = set()
+    anchors = [i for i, sample in enumerate(path) if sample.point is not None or sample.source == "excluded"]
+    right_anchors = iter(anchors)
+    anchor_after = next(right_anchors, None)
+    for i, sample in enumerate(path):
+        if i == anchor_after:
+            anchor_before = i
+            anchor_after = next(right_anchors, None)
+            continue
+        left = path[anchor_before].point if anchor_before is not None and i - anchor_before <= nearby else None
+        right = path[anchor_after].point if anchor_after is not None and anchor_after - i <= nearby else None
+        if left is not None and right is not None:
+            references[i] = interpolate(left, right, (i - anchor_before) / (anchor_after - anchor_before))
+            bracketed.add(i)
+        else:
+            references[i] = left if left is not None else right
+
+    previous_pass = list(path)
+    for i, detection in enumerate(detections):
+        if previous_pass[i].source != "missing":
+            continue
+        reference, tip = references[i], detection.shaft_tip
+        adjacent_tips = [detections[j].shaft_tip for j in (i - 1, i + 1)
+                         if 0 <= j < len(path) and previous_pass[j].source != "excluded"]
+        tip_agrees = tip is not None and (
+            (reference is not None and distance(reference, tip) <= 0.15 * diagonal)
+            or any(other is not None and distance(tip, other) <= 0.12 * diagonal
+                   for other in adjacent_tips)
+        )
+        candidates = [
+            (point, score) for point, score in detection.heads
+            if ((tip_agrees and distance(tip, point) <= 0.08 * diagonal)
+                or (reference is not None and distance(reference, point) <= 0.055 * diagonal))
+            and (reference is None or distance(reference, point) <= 0.18 * diagonal)
+        ]
+        if candidates:
+            point, _ = max(candidates, key=lambda hit: hit[1])
+            path[i] = Sample(clip(point), "head", True)
+        elif tip_agrees:
+            path[i] = Sample(clip(tip), "shaft", True)
+        elif i in bracketed and detection.shafts:
+            corners = [(x, y) for x1, y1, x2, y2 in detection.shafts
+                       for x in (x1, x2) for y in (y1, y2)]
+            closest = min(corners, key=lambda corner: distance(reference, corner))
+            if distance(reference, closest) <= 0.055 * diagonal:
+                path[i] = Sample(clip(closest), "shaft", True)
+
+    gap_span = max(1, round(fps * 0.14))
+    anchors = [i for i, sample in enumerate(path) if sample.point is not None or sample.source == "excluded"]
     for left, right in zip(anchors, anchors[1:]):
         first, last = path[left].point, path[right].point
         if first is None or last is None or right - left > gap_span + 1:
+            continue
+        if distance(first, last) > diagonal * min(0.34, (right - left) * 0.11):
             continue
         for index in range(left + 1, right):
             point = interpolate(first, last, (index - left) / (right - left))
