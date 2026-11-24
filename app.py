@@ -1,11 +1,14 @@
 """Standalone SwingTrace review and export app."""
 from __future__ import annotations
 
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from pathlib import Path
+import re
+from shutil import copyfileobj
 import tempfile
 from uuid import uuid4
 
+import cv2
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -13,7 +16,7 @@ from tracking import Detector, estimate_path
 from trajectory import estimate_timing, render_trajectory
 from video_io import (
     DEFAULT_TRAIL_STYLE, MAX_FRAMES, MAX_SECONDS, TrailStyle,
-    analyze, export_video, normalize, preview_jpeg,
+    VideoInfo, analyze, export_video, normalize, open_video, preview_jpeg, run_ffmpeg,
 )
 
 st.set_page_config(page_title="SwingTrace クラブヘッド追跡", page_icon="⛳", layout="wide")
@@ -89,9 +92,27 @@ def click_frame_assets() -> tempfile.TemporaryDirectory:
 click_frame = components.declare_component(
     "swingtrace_click_frame", path=click_frame_assets().name
 )
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".3gp", ".webm"}
-VIDEO_FORMATS_LABEL = "MP4・MOV・M4V・3GP・WebM"
-MAX_UPLOAD_MB = 100
+MAX_UPLOAD_MB = 200
+MOBILE_CHUNK_BYTES = 256 * 1024
+MOBILE_MAX_SECONDS = 60
+MOBILE_MAX_FPS = 60
+
+MOBILE_UPLOAD_HTML = r"""<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+body{margin:0;font-family:Arial,'Yu Gothic',sans-serif;color:#19382c}*{box-sizing:border-box}.box{padding:12px;background:#f0f4ef;border:1px solid #cbd5c6;border-radius:8px}button{font:inherit;padding:12px;border:1px solid #9caf98;border-radius:6px;background:white;color:#19382c;cursor:pointer;margin:4px 4px 4px 0}button:disabled{opacity:.45;cursor:default}#send{background:#247052;color:white}#name{margin:10px 0;overflow-wrap:anywhere;font-weight:bold}#status{font-size:14px;line-height:1.6;white-space:pre-wrap}progress{width:100%;height:18px}small{display:block;margin:8px 0;color:#52644c;line-height:1.6}
+</style><div class="box" id="root"><button id="choose">① ファイルから__MEDIA__を選ぶ</button><button id="gallery">__GALLERY__</button><input type="file" id="files" hidden><input type="file" id="videos" accept="__ACCEPT__" hidden><div id="name">__MEDIA__はまだ選ばれていません</div><button id="send" disabled>② __MEDIA__を送信</button><progress id="progress" value="0" max="100"></progress><div id="status" role="status">端末内に保存した__MEDIA__を選んでください（__LIMIT__MBまで）</div><small>__MEDIA__名が出たら「② __MEDIA__を送信」を押してください__AFTER_SEND__</small></div><script>
+const $=id=>document.getElementById(id);let file=null,busy=false,args={},pending=null,picker=false;
+function post(type,extra={}){window.parent.postMessage({isStreamlitMessage:true,type,...extra},'*');}
+function height(){post('streamlit:setFrameHeight',{height:Math.ceil($('root').getBoundingClientRect().height)+8});}
+function status(t){$('status').textContent=t;height();}
+function controls(){for(const id of ['choose','gallery','files','videos'])$(id).disabled=busy;$('send').disabled=busy||!file;}
+for(const [button,input] of [['choose','files'],['gallery','videos']]){$(button).onclick=()=>{picker=true;$(input).value='';$(input).click();};$(input).onchange=()=>{picker=false;const f=$(input).files[0];if(!f)return;file=f;$('name').textContent=f.name+'（'+(f.size/1048576).toFixed(1)+' MB）';$('progress').value=0;if(!f.size||f.size>__LIMIT__*1048576){file=null;status('空の__MEDIA__、または__LIMIT__MBを超える__MEDIA__です。別の__MEDIA__を選んでください。');}else status('__MEDIA__を選択しました。「② __MEDIA__を送信」を押してください。');controls();height();};}
+window.addEventListener('focus',()=>{if(picker)setTimeout(()=>{if(picker){picker=false;status('__MEDIA__名がまだ返っていません。「① ファイルから__MEDIA__を選ぶ」で端末内の__MEDIA__を選んでください。');}},2000);});
+function send(value,expected){return new Promise((resolve,reject)=>{let attempts=0;const transmit=()=>{post('streamlit:setComponentValue',{dataType:'json',value});};const timer=setInterval(()=>{if(++attempts>=3){clearInterval(timer);pending=null;reject(Error('応答がありません。アプリを開き直してから、もう一度送信してください。'));}else{status('接続を確認して再送しています…');transmit();}},15000);pending={id:value.id,expected,resolve:()=>{clearInterval(timer);pending=null;resolve();},reject:e=>{clearInterval(timer);pending=null;reject(Error(e));}};transmit();});}
+function read(slice){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result).split(',')[1]);r.onerror=()=>reject(Error('この__MEDIA__を端末から読み出せません。端末内へ保存した__MEDIA__で試してください。'));r.readAsDataURL(slice);});}
+$('send').onclick=async()=>{if(!file||busy)return;const chosen=file,id=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);busy=true;controls();try{status('送信を開始しています…');await send({kind:'begin',id,name:chosen.name,size:chosen.size},0);let seq=0;for(let offset=0;offset<chosen.size;offset+=262144){const end=Math.min(chosen.size,offset+262144),data=await read(chosen.slice(offset,end));status('__MEDIA__を送信中… '+Math.floor(offset/chosen.size*100)+'%');await send({kind:'chunk',id,seq,data},seq+1);seq++;$('progress').value=Math.round(end/chosen.size*100);}status('受信完了__AFTER_SEND__');}catch(e){status(e.message);}finally{busy=false;controls();}};
+window.addEventListener('message',e=>{if(e.source!==window.parent||e.data.type!=='streamlit:render')return;args=e.data.args||{};if(pending&&args.transfer_id===pending.id){if(args.error)pending.reject(args.error);else if(args.next_seq>=pending.expected)pending.resolve();}if(!file&&args.complete){$('name').textContent='受信済み：'+args.name;$('progress').value=100;status('受信完了__AFTER_SEND__');}height();});
+new ResizeObserver(height).observe($('root'));post('streamlit:componentReady',{apiVersion:1});height();
+</script></html>"""
 
 st.title("SwingTrace クラブヘッド追跡")
 st.caption("スイング動画を選択 → 自動追跡 → 外れたコマをクリックで修正 → MP4を保存")
@@ -116,21 +137,134 @@ def upload_error(upload) -> str | None:
         return "動画が空です。端末に保存した動画を選び直してください。"
     if upload.size > MAX_UPLOAD_MB * 1024 * 1024:
         return f"動画の容量が上限を超えています。{MAX_UPLOAD_MB} MB以下に短くして選び直してください。"
-    if Path(upload.name).suffix.lower() not in VIDEO_EXTENSIONS:
-        return f"{VIDEO_FORMATS_LABEL}の動画を選んでください。"
     return None
+
+
+def accept_mobile_upload(state: dict, event) -> bool:
+    if not isinstance(event, dict):
+        return False
+    transfer_id = event.get("id")
+    if not isinstance(transfer_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,80}", transfer_id):
+        return False
+    kind = event.get("kind")
+    if kind == "begin":
+        if state.get("id") == transfer_id:
+            return False
+        size, name = event.get("size"), event.get("name")
+        if type(size) is not int or not 0 < size <= MAX_UPLOAD_MB * 1024 * 1024:
+            return False
+        if not isinstance(name, str) or not 0 < len(name) <= 512:
+            return False
+        directory = tempfile.TemporaryDirectory(prefix="swingtrace-upload-")
+        state.clear()
+        state.update(id=transfer_id, name=name, size=size, directory=directory,
+                     path=Path(directory.name) / "video", received=0, next_seq=0)
+        return True
+    if kind != "chunk" or state.get("id") != transfer_id or state.get("error"):
+        return False
+    seq = event.get("seq")
+    if type(seq) is not int or seq != state["next_seq"]:
+        return False
+    try:
+        encoded = event.get("data")
+        if not isinstance(encoded, str) or len(encoded) > 4 * ((MOBILE_CHUNK_BYTES + 2) // 3):
+            raise ValueError("送信データのサイズが不正です。")
+        chunk = b64decode(encoded, validate=True)
+        expected = min(MOBILE_CHUNK_BYTES, state["size"] - state["received"])
+        if not expected or len(chunk) != expected:
+            raise ValueError("動画の一部を受信できませんでした。もう一度送信してください。")
+        with state["path"].open("ab") as output:
+            output.write(chunk)
+        state["next_seq"] += 1
+        state["received"] += len(chunk)
+    except ValueError as error:
+        state["error"] = str(error)
+    except OSError:
+        state["error"] = "サーバーに動画を保存できませんでした。"
+    return True
+
+
+class MobileUpload:
+    def __init__(self, state: dict):
+        self.name = state["name"]
+        self.size = state["size"]
+        self.path = state["path"]
+
+
+@st.cache_resource(show_spinner=False)
+def mobile_upload_assets() -> tempfile.TemporaryDirectory:
+    html = (MOBILE_UPLOAD_HTML.replace("__MEDIA__", "動画")
+            .replace("__LIMIT__", str(MAX_UPLOAD_MB))
+            .replace("__GALLERY__", "写真・動画から選ぶ")
+            .replace("__ACCEPT__", "video/*")
+            .replace("__AFTER_SEND__", "。下の「自動追跡する」を押してください。"))
+    directory = tempfile.TemporaryDirectory(prefix="swingtrace-mobile-picker-")
+    (Path(directory.name) / "index.html").write_text(html, encoding="utf-8")
+    return directory
+
+
+mobile_picker = components.declare_component(
+    "swingtrace_mobile_import", path=mobile_upload_assets().name
+)
+
+
+def mobile_upload() -> MobileUpload | None:
+    state = st.session_state.setdefault("swingtrace_mobile_import", {})
+    complete = "size" in state and state["received"] == state["size"]
+    event = mobile_picker(
+        transfer_id=state.get("id"), next_seq=state.get("next_seq", -1),
+        complete=complete, error=state.get("error"), name=state.get("name", ""),
+        key="swingtrace_mobile_upload_widget", default=None,
+    )
+    if accept_mobile_upload(state, event):
+        st.rerun()
+    if state.get("error"):
+        st.error(state["error"])
+    return MobileUpload(state) if complete and not state.get("error") else None
+
+
+def normalize_mobile(source: Path, output: Path) -> VideoInfo:
+    # Match the working golf-swing-python import profile while retaining audio for export.
+    scale = ("scale=w='min(960,iw)':h='min(960,ih)':force_original_aspect_ratio=decrease:"
+             f"force_divisible_by=2,setsar=1,fps='min(source_fps,{MOBILE_MAX_FPS})'")
+    run_ffmpeg([
+        "-nostdin", "-threads", "2", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
+        "-t", str(MOBILE_MAX_SECONDS + 1), "-filter_threads", "2", "-vf", scale,
+        "-c:v", "libx264", "-threads:v", "2", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(output),
+    ])
+    with open_video(output) as capture:
+        info = VideoInfo(
+            capture.get(cv2.CAP_PROP_FPS), int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(capture.get(cv2.CAP_PROP_FRAME_COUNT)),
+        )
+        if info.frames < 1 or not 0 < info.fps <= MOBILE_MAX_FPS or not capture.grab():
+            raise RuntimeError("動画の映像やフレーム情報を取得できませんでした。")
+    if info.frames / info.fps > MOBILE_MAX_SECONDS + 0.05:
+        raise RuntimeError(f"動画を{MOBILE_MAX_SECONDS}秒以内に切り出してください。")
+    return info
 
 
 def start_job(upload, image_size: int):
     job_dir = tempfile.TemporaryDirectory(prefix="swingtrace-")
     root = Path(job_dir.name)
-    input_path = root / ("original" + Path(upload.name).suffix.lower())
+    suffix = Path(upload.name).suffix.lower()
+    input_path = root / ("original" + (suffix if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix) else ".mp4"))
     source = root / "normalized.mp4"
     try:
-        with input_path.open("wb") as file, upload.getbuffer() as data:
-            file.write(data)
+        mobile = isinstance(upload, MobileUpload)
+        with input_path.open("wb") as file:
+            if mobile:
+                with upload.path.open("rb") as data:
+                    copyfileobj(data, file)
+            else:
+                with upload.getbuffer() as data:
+                    file.write(data)
         with st.spinner("動画を読み込んでいます…"):
-            info = normalize(input_path, source)
+            try:
+                info = (normalize_mobile if mobile else normalize)(input_path, source)
+            except RuntimeError as error:
+                raise RuntimeError(f"動画は受信済みですが、読み込みに失敗しました。{error}") from error
         input_path.unlink()
         with st.spinner("SwingTraceモデルを準備中です。初回は約40MBを取得します…"):
             detector = get_detector()
@@ -170,14 +304,20 @@ def move_to(key: str, position: int) -> None:
 
 with st.container():
     st.subheader("動画を選択")
-    # Androidのファイル選択画面では形式指定で動画が隠れる場合があるため、
-    # 選択後にアプリ側で形式と容量を確認する。
-    upload = st.file_uploader("スイング動画", type=None, label_visibility="collapsed")
-    st.caption(f"{VIDEO_FORMATS_LABEL}に対応。上限{MAX_UPLOAD_MB} MB、{MAX_SECONDS}秒、{MAX_FRAMES:,}コマ。")
-    if upload is None:
-        st.caption("Androidで動画が見つからない場合は「ファイル」から端末に保存した動画を選んでください。")
-        upload_ready = False
+    android = "android" in st.context.headers.get("User-Agent", "").lower()
+    method = st.radio("動画の取り込み方法", ("通常（PCなど）", "Android向け（分割送信）"),
+                      index=int(android), horizontal=True)
+    if method == "Android向け（分割送信）":
+        upload = mobile_upload()
+        st.caption(f"上限{MAX_UPLOAD_MB} MB・{MOBILE_MAX_SECONDS}秒。"
+                   f"解析用の動画は長辺960 px・最大{MOBILE_MAX_FPS} fpsに調整します。")
     else:
+        st.session_state.pop("swingtrace_mobile_import", None)
+        upload = st.file_uploader("動画を選択", type=None)
+        st.caption(f"上限{MAX_UPLOAD_MB} MB・{MAX_SECONDS}秒・{MAX_FRAMES:,}コマ。"
+                   "ファイル名が出ない場合は「Android向け（分割送信）」を選んでください。")
+    upload_ready = False
+    if upload is not None:
         error = upload_error(upload)
         upload_ready = error is None
         if error:
