@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.interpolate import CubicSpline, PchipInterpolator
+from scipy.interpolate import CubicHermiteSpline, CubicSpline, PchipInterpolator
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 from scipy.ndimage import gaussian_filter1d
@@ -59,13 +59,47 @@ def estimate_timing(path: list[Sample], fps: float, height: int) -> Timing:
     return fallback
 
 
-def smooth_path(path: list[Sample], fps: float, width: int, height: int, end: int) -> list[Sample]:
+def render_trajectory(path: list[Sample], fps: float, width: int, height: int, end: int,
+                      *, occlusion_end: int | None = None) -> list[Sample]:
+    """Join the two sides of an automatically located occlusion by their tangents."""
+    if occlusion_end is None or not 0 <= occlusion_end < end:
+        return smooth_path(path, fps, width, height, end)
+    left = occlusion_end
+    right = next((i for i in range(left + 1, end + 1) if path[i].point is not None), None)
+    if right is None or right == left + 1 or path[left].point is None:
+        return smooth_path(path, fps, width, height, end)
+
+    before = smooth_path(path, fps, width, height, left)
+    after = smooth_path(path, fps, width, height, end, start=right)
+    result = before[:left + 1] + path[left + 1:right] + after[right:]
+    if any(sample.source == "excluded" for sample in path[left + 1:right]):
+        return result
+
+    p0 = np.asarray(before[left].point, dtype=float)
+    p1 = np.asarray(after[right].point, dtype=float)
+    mean_velocity = (p1 - p0) / (right - left)
+    limit = max(0.005 * np.hypot(width, height), 2.4 * np.linalg.norm(mean_velocity))
+    tangents = [mean_velocity, mean_velocity]
+    if left and before[left - 1].point is not None:
+        tangents[0] = p0 - before[left - 1].point
+    if right < end and after[right + 1].point is not None:
+        tangents[1] = np.asarray(after[right + 1].point) - p1
+    tangents = [v * min(1, limit / max(np.linalg.norm(v), 1e-6)) for v in tangents]
+    bridge = CubicHermiteSpline([left, right], [p0, p1], tangents, axis=0)
+    points = np.rint(np.clip(bridge(np.arange(left + 1, right)), [0, 0], [width - 1, height - 1]))
+    for index, point in enumerate(points, left + 1):
+        result[index] = Sample(tuple(map(int, point)), "interpolated", True)
+    return result
+
+
+def smooth_path(path: list[Sample], fps: float, width: int, height: int, end: int,
+                *, start: int = 0) -> list[Sample]:
     """Fit a smooth curve to detected points within the chosen drawing range."""
     updated = list(path)
     stop = min(end + 1, len(path))
-    breaks = [-1, *(i for i in range(stop) if path[i].source == "excluded"), stop]
-    for start, finish in zip(breaks, breaks[1:]):
-        known = [i for i in range(start + 1, finish) if path[i].point is not None]
+    breaks = [start - 1, *(i for i in range(start, stop) if path[i].source == "excluded"), stop]
+    for previous_break, finish in zip(breaks, breaks[1:]):
+        known = [i for i in range(previous_break + 1, finish) if path[i].point is not None]
         if len(known) < 2:
             continue
         first, last = known[0], known[-1]

@@ -10,7 +10,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from tracking import Detector, estimate_path
-from trajectory import estimate_timing, smooth_path
+from trajectory import estimate_timing, render_trajectory
 from video_io import MAX_FRAMES, MAX_SECONDS, analyze, export_video, normalize, preview_jpeg
 
 st.set_page_config(page_title="SwingTrace クラブヘッド追跡", page_icon="⛳", layout="wide")
@@ -161,6 +161,13 @@ with st.container():
         896: "高精度（未検出のコマを再解析）", 640: "標準", 480: "高速",
     }[size], horizontal=True)
     st.caption("高精度モードは処理に時間がかかります。まずは短いスイング動画でお試しください。")
+    scope = st.radio(
+        "軌道の描画範囲", ("stop", "follow"),
+        format_func=lambda value: {
+            "stop": "体に隠れるまで",
+            "follow": "隠れた区間も補間してフォローまで",
+        }[value], horizontal=True, key="drawing_scope",
+    )
     auto_export = st.checkbox("解析後に軌道付きMP4も自動で作成", value=True)
     loaded = st.session_state.get("job")
     if st.button("自動追跡する", disabled=upload is None, type="primary"):
@@ -173,6 +180,7 @@ with st.container():
                 loaded["temp"].cleanup()
                 st.session_state.pop(f"frame_{loaded['id']}", None)
             new_job["auto_export_pending"] = auto_export
+            new_job["drawing_scope"] = scope
             st.session_state.job = new_job
 
 job = st.session_state.get("job")
@@ -182,9 +190,21 @@ if job is None:
 info = job["info"]
 path = estimate_path(job["detections"], job["corrections"], info.fps, info.width, info.height)
 suggestion = estimate_timing(path, info.fps, info.height)
-end = job.get("end")
-end = suggestion.end if end is None else end
-render_path = smooth_path(path, info.fps, info.width, info.height, end)
+if job.get("drawing_scope", "stop") != scope:
+    invalidate_export(job)
+    job["drawing_scope"] = scope
+    job["auto_export_pending"] = auto_export
+
+include_follow = scope == "follow"
+end_key = "follow_end" if include_follow else "end"
+last_seen = next((i for i in reversed(range(len(path))) if path[i].point is not None), suggestion.end)
+default_end = last_seen if include_follow else suggestion.end
+manual_end = job.get(end_key)
+end = default_end if manual_end is None else manual_end
+render_path = render_trajectory(
+    path, info.fps, info.width, info.height, end,
+    occlusion_end=suggestion.end if include_follow and suggestion.occlusion_found else None,
+)
 split = job.get("split")
 split = suggestion.split if split is None else split
 split = split if split is not None and split <= end else None
@@ -239,8 +259,10 @@ else:
     st.caption(f"青 → 赤　{split + 1:,}コマ目（{split / info.fps:.2f}秒）"
                f"{' ・ 自動候補' if job.get('split') is None else ''}")
 end_label = ""
-if job.get("end") is None:
-    end_label = " ・ 自動候補" if suggestion.occlusion_found else " ・ 最後の検出点"
+if manual_end is None:
+    end_label = " ・ 最後の検出点" if include_follow or not suggestion.occlusion_found else " ・ 自動候補"
+if include_follow and suggestion.occlusion_found and last_seen <= suggestion.end:
+    st.caption("ヘッドが再び見えるコマを検出できた場合に、フォローまで描画します。")
 st.caption(f"描画終了　{end + 1:,}コマ目（{end / info.fps:.2f}秒）{end_label}")
 timing = st.columns(3)
 if timing[0].button("このコマで青 → 赤", disabled=index >= end, width="stretch"):
@@ -248,13 +270,13 @@ if timing[0].button("このコマで青 → 赤", disabled=index >= end, width="
     invalidate_export(job)
     st.rerun()
 if timing[1].button("このコマで描画終了", disabled=current.point is None, width="stretch"):
-    job["end"] = index
+    job[end_key] = index
     invalidate_export(job)
     st.rerun()
 if timing[2].button("色と終了を自動に戻す",
-                    disabled=job.get("split") is None and job.get("end") is None, width="stretch"):
+                    disabled=job.get("split") is None and manual_end is None, width="stretch"):
     job["split"] = None
-    job["end"] = None
+    job[end_key] = None
     invalidate_export(job)
     st.rerun()
 seek_controls = st.columns(2)
