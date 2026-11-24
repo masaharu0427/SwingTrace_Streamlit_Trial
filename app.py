@@ -89,6 +89,10 @@ def click_frame_assets() -> tempfile.TemporaryDirectory:
 click_frame = components.declare_component(
     "swingtrace_click_frame", path=click_frame_assets().name
 )
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".3gp", ".webm"}
+VIDEO_FORMATS_LABEL = "MP4・MOV・M4V・3GP・WebM"
+MAX_UPLOAD_MB = 100
+
 st.title("SwingTrace クラブヘッド追跡")
 st.caption("スイング動画を選択 → 自動追跡 → 外れたコマをクリックで修正 → MP4を保存")
 
@@ -107,9 +111,17 @@ def get_detector() -> Detector:
     return Detector()
 
 
+def upload_error(upload) -> str | None:
+    if upload.size == 0:
+        return "動画が空です。端末に保存した動画を選び直してください。"
+    if upload.size > MAX_UPLOAD_MB * 1024 * 1024:
+        return f"動画の容量が上限を超えています。{MAX_UPLOAD_MB} MB以下に短くして選び直してください。"
+    if Path(upload.name).suffix.lower() not in VIDEO_EXTENSIONS:
+        return f"{VIDEO_FORMATS_LABEL}の動画を選んでください。"
+    return None
+
+
 def start_job(upload, image_size: int):
-    if upload.size > 100 * 1024 * 1024:
-        raise RuntimeError("100 MB以下の動画に切り詰めてください。")
     job_dir = tempfile.TemporaryDirectory(prefix="swingtrace-")
     root = Path(job_dir.name)
     input_path = root / ("original" + Path(upload.name).suffix.lower())
@@ -158,8 +170,20 @@ def move_to(key: str, position: int) -> None:
 
 with st.container():
     st.subheader("動画を選択")
-    upload = st.file_uploader("スイング動画", type=["mp4", "mov", "m4v"], label_visibility="collapsed")
-    st.caption(f"1人・1スイング。上限100 MB、{MAX_SECONDS}秒、{MAX_FRAMES:,}コマ。")
+    # Androidのファイル選択画面では形式指定で動画が隠れる場合があるため、
+    # 選択後にアプリ側で形式と容量を確認する。
+    upload = st.file_uploader("スイング動画", type=None, label_visibility="collapsed")
+    st.caption(f"{VIDEO_FORMATS_LABEL}に対応。上限{MAX_UPLOAD_MB} MB、{MAX_SECONDS}秒、{MAX_FRAMES:,}コマ。")
+    if upload is None:
+        st.caption("Androidで動画が見つからない場合は「ファイル」から端末に保存した動画を選んでください。")
+        upload_ready = False
+    else:
+        error = upload_error(upload)
+        upload_ready = error is None
+        if error:
+            st.error(error)
+        else:
+            st.success(f"動画を受け取りました（{upload.size / (1024 * 1024):.1f} MB）。「自動追跡する」を押してください。")
     image_size = st.radio("追跡モード", [896, 640, 480], format_func=lambda size: {
         896: "高精度（未検出のコマを再解析）", 640: "標準", 480: "高速",
     }[size], horizontal=True)
@@ -181,7 +205,7 @@ with st.container():
     style_key = (style.before, style.after, style.thickness)
     auto_export = st.checkbox("解析後に軌道付きMP4も自動で作成", value=True)
     loaded = st.session_state.get("job")
-    if st.button("自動追跡する", disabled=upload is None, type="primary"):
+    if st.button("自動追跡する", disabled=not upload_ready, type="primary"):
         try:
             new_job = start_job(upload, image_size)
         except Exception as error:
