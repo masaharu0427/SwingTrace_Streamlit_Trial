@@ -33,8 +33,116 @@ html::-webkit-scrollbar-thumb:vertical,
     border: 2px solid #e8eeec;
     border-radius: 12px;
 }
+@media (pointer: coarse) {
+    [data-testid="stMainBlockContainer"] { padding-right: max(2.5rem, env(safe-area-inset-right)); }
+}
 </style>
 """, unsafe_allow_html=True)
+
+mobile_scrollbar = st.components.v2.component(
+    "swingtrace_mobile_scrollbar",
+    html="""<div id="rail" role="scrollbar" aria-label="ページの縦スクロール"
+         aria-orientation="vertical" aria-valuemin="0" aria-valuemax="100"
+         aria-valuenow="0" tabindex="0" hidden><div id="thumb"></div></div>""",
+    css="""
+    #rail {
+        position: fixed;
+        top: 4rem;
+        bottom: max(8px, env(safe-area-inset-bottom));
+        right: max(3px, env(safe-area-inset-right));
+        width: 28px;
+        z-index: 10;
+        background: #e8eeec;
+        border-radius: 14px;
+        touch-action: none;
+        user-select: none;
+    }
+    #rail[hidden] { display: none; }
+    #thumb {
+        position: absolute;
+        left: 3px;
+        right: 3px;
+        background: #648478;
+        border-radius: 12px;
+    }
+    """,
+    js=r"""
+    export default function ({parentElement}) {
+        const rail = parentElement.querySelector("#rail");
+        const thumb = parentElement.querySelector("#thumb");
+        const main = document.querySelector('[data-testid="stMain"]');
+        const page = document.scrollingElement;
+        const touch = matchMedia("(pointer: coarse)");
+        const listeners = new AbortController();
+        const options = {signal: listeners.signal};
+        let scroller = main || page;
+        let maxScroll = 0;
+        let travel = 0;
+        let drag = null;
+
+        function sync() {
+            scroller = main && main.scrollHeight > main.clientHeight + 1 ? main : page;
+            maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+            rail.hidden = !touch.matches || maxScroll < 2;
+            if (rail.hidden) return;
+            const height = rail.clientHeight;
+            const thumbHeight = Math.min(height, Math.max(44, height * scroller.clientHeight / scroller.scrollHeight));
+            travel = height - thumbHeight;
+            const fraction = Math.max(0, Math.min(1, scroller.scrollTop / maxScroll));
+            thumb.style.height = thumbHeight + "px";
+            thumb.style.top = fraction * travel + "px";
+            rail.setAttribute("aria-valuenow", Math.round(fraction * 100));
+        }
+
+        function scrollAt(clientY) {
+            if (!travel) return;
+            const top = clientY - rail.getBoundingClientRect().top - drag.offset;
+            scroller.scrollTop = maxScroll * Math.max(0, Math.min(1, top / travel));
+            sync();
+        }
+
+        rail.addEventListener("pointerdown", event => {
+            if (event.button !== 0 || drag || !travel) return;
+            event.preventDefault();
+            const box = thumb.getBoundingClientRect();
+            const onThumb = event.clientY >= box.top && event.clientY <= box.bottom;
+            drag = {id: event.pointerId, offset: onThumb ? event.clientY - box.top : box.height / 2};
+            rail.setPointerCapture(event.pointerId);
+            if (!onThumb) scrollAt(event.clientY);
+        }, options);
+        rail.addEventListener("pointermove", event => {
+            if (drag?.id === event.pointerId) scrollAt(event.clientY);
+        }, options);
+        rail.addEventListener("lostpointercapture", event => {
+            if (drag?.id === event.pointerId) drag = null;
+        }, options);
+        rail.addEventListener("keydown", event => {
+            const steps = {
+                ArrowUp: -40, ArrowDown: 40, PageUp: -scroller.clientHeight,
+                PageDown: scroller.clientHeight, Home: -maxScroll, End: maxScroll
+            };
+            if (!Object.hasOwn(steps, event.key)) return;
+            event.preventDefault();
+            scroller.scrollTop += steps[event.key];
+            sync();
+        }, options);
+        document.addEventListener("scroll", sync, {...options, capture: true});
+        window.addEventListener("resize", sync, options);
+        touch.addEventListener("change", sync, options);
+        const observer = new ResizeObserver(sync);
+        observer.observe(main || page);
+        const content = document.querySelector('[data-testid="stMainBlockContainer"]');
+        if (content) observer.observe(content);
+        sync();
+        return () => {
+            observer.disconnect();
+            listeners.abort();
+            rail.hidden = true;
+        };
+    }
+    """,
+)
+mobile_scrollbar(key="mobile_page_scrollbar")
 
 # The component is embedded so deployment only needs this Python file for the editor.
 CLICK_FRAME_HTML = r'''<!doctype html>
