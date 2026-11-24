@@ -20,6 +20,21 @@ from video_io import (
 )
 
 st.set_page_config(page_title="SwingTrace クラブヘッド追跡", page_icon="⛳", layout="wide")
+st.markdown("""
+<style>
+html, [data-testid="stMain"] { scrollbar-width: auto; }
+html::-webkit-scrollbar:vertical,
+[data-testid="stMain"]::-webkit-scrollbar:vertical { width: 22px; }
+html::-webkit-scrollbar-track:vertical,
+[data-testid="stMain"]::-webkit-scrollbar-track:vertical { background: #e8eeec; }
+html::-webkit-scrollbar-thumb:vertical,
+[data-testid="stMain"]::-webkit-scrollbar-thumb:vertical {
+    background: #648478;
+    border: 2px solid #e8eeec;
+    border-radius: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # The component is embedded so deployment only needs this Python file for the editor.
 CLICK_FRAME_HTML = r'''<!doctype html>
@@ -382,7 +397,9 @@ if job.get("trail_style") != style_key:
 include_follow = scope == "follow"
 end_key = "follow_end" if include_follow else "end"
 last_seen = next((i for i in reversed(range(len(path))) if path[i].point is not None), suggestion.end)
-default_end = last_seen if include_follow else suggestion.end
+default_end = last_seen
+if not include_follow:
+    default_end = suggestion.end if suggestion.occlusion_found else -1
 manual_end = job.get(end_key)
 end = default_end if manual_end is None else manual_end
 render_path = render_trajectory(
@@ -442,33 +459,39 @@ if split is None:
 else:
     st.caption(f"色の切り替え　{split + 1:,}コマ目（{split / info.fps:.2f}秒）"
                f"{' ・ 自動候補' if job.get('split') is None else ''}")
-end_label = ""
-if manual_end is None:
-    end_label = " ・ 最後の検出点" if include_follow or not suggestion.occlusion_found else " ・ 自動候補"
 if include_follow and suggestion.occlusion_found and last_seen <= suggestion.end:
     st.caption("ヘッドが再び見えるコマを検出できた場合に、フォローまで描画します。")
-st.caption(f"描画終了　{end + 1:,}コマ目（{end / info.fps:.2f}秒）{end_label}")
+if end < 0:
+    st.warning("ヘッドが隠れる位置を自動で特定できませんでした。コマ番号でヘッドが隠れる直前に移動し、「このコマで描画終了」を押してください。")
+else:
+    end_label = " ・ 手動指定" if manual_end is not None else (
+        " ・ 最後の検出点" if include_follow else " ・ 隠れる直前の自動候補"
+    )
+    st.caption(f"描画終了　{end + 1:,}コマ目（{end / info.fps:.2f}秒）{end_label}")
 timing = st.columns(3)
 if timing[0].button("このコマで色を切り替える", disabled=index >= end, width="stretch"):
     job["split"] = index
     invalidate_export(job)
     st.rerun()
-if timing[1].button("このコマで描画終了", disabled=current.point is None, width="stretch"):
+if timing[1].button("このコマで描画終了", width="stretch"):
     job[end_key] = index
     invalidate_export(job)
+    job["auto_export_pending"] = auto_export
     st.rerun()
 if timing[2].button("色と終了を自動に戻す",
                     disabled=job.get("split") is None and manual_end is None, width="stretch"):
     job["split"] = None
     job[end_key] = None
     invalidate_export(job)
+    job["auto_export_pending"] = auto_export
     st.rerun()
 seek_controls = st.columns(2)
 if split is not None:
     seek_controls[0].button("色の切り替えを確認", on_click=move_to,
                             args=(frame_key, split + 1), width="stretch")
-seek_controls[1].button("終了点を確認", on_click=move_to,
-                        args=(frame_key, end + 1), width="stretch")
+if end >= 0:
+    seek_controls[1].button("終了点を確認", on_click=move_to,
+                            args=(frame_key, end + 1), width="stretch")
 
 try:
     jpeg = preview_jpeg(job["source"], render_path, index, show_trail,
@@ -494,9 +517,9 @@ st.subheader("軌道付き動画")
 st.caption("描画範囲内の未検出区間は前後の動きから推定します。描画終了後も軌道を表示したまま再生します。")
 if missing:
     st.caption(f"描画範囲内に補間できなかったコマが {missing:,} 枚あります。")
-can_export = any(p.point is not None for p in render_path[:end + 1])
+can_export = end >= 0 and any(p.point is not None for p in render_path[:end + 1])
 requested = st.button("軌道付きMP4を作成", type="primary", disabled=not can_export)
-auto_requested = job.pop("auto_export_pending", False)
+auto_requested = can_export and job.pop("auto_export_pending", False)
 if can_export and (auto_requested or requested):
     target = job["source"].with_name("swingtrace.mp4")
     progress = st.progress(0, text="軌道付き動画を書き出しています…")

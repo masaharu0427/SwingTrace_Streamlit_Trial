@@ -47,16 +47,25 @@ def estimate_timing(path: list[Sample], fps: float, height: int) -> Timing:
         reversals, _ = find_peaks(y[top:impact], prominence=height * 0.006)
         split = first + int(top) + (int(reversals[0]) if len(reversals) else 0)
         near_impact = np.flatnonzero(y[impact:] >= y[top] + 0.90 * lift)
-        after = first + impact + (int(near_impact[0]) if len(near_impact) else 0)
-        gap_size = max(3, round(fps * 0.20))
-        end = fallback.end
-        occlusion_found = end < len(path) - 1
-        for left, right in zip(valid, valid[1:]):
-            if left >= after and right - left - 1 >= gap_size:
-                end, occlusion_found = int(left), True
-                break
-        return Timing(split, max(split, end), occlusion_found)
+        impact_frame = first + impact + (int(near_impact[0]) if len(near_impact) else 0)
+        end = find_occlusion_end(path, impact_frame, split, fps)
+        return Timing(split, end if end is not None else fallback.end, end is not None)
     return fallback
+
+
+def find_occlusion_end(path: list[Sample], impact: int, split: int, fps: float) -> int | None:
+    # Shaft estimates and interpolated points can remain available while the head is hidden.
+    direct = {i for i, sample in enumerate(path)
+              if sample.point is not None and sample.source in ("head", "manual")}
+    visible = sorted(i for i in direct if not path[i].suspect or i - 1 in direct or i + 1 in direct)
+    gap_size = max(3, round(fps * 0.10))
+    earliest = max(split + 1, impact - round(fps * 0.08))
+    latest = impact + round(fps * 0.45)
+    for left, right in zip(visible, [*visible[1:], len(path)]):
+        first_hidden = left + 1
+        if earliest <= first_hidden <= latest and right - first_hidden >= gap_size:
+            return left
+    return None
 
 
 def render_trajectory(path: list[Sample], fps: float, width: int, height: int, end: int,
