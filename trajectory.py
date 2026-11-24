@@ -57,6 +57,29 @@ def estimate_timing(path: list[Sample], fps: float, height: int) -> Timing:
     return fallback
 
 
+def motion_support(path: list[Sample], left: int, right: int, fps: float, diagonal: float) -> list[int]:
+    """Return boundary observations for a longer gap when motion is consistent."""
+    if right - left - 1 > round(fps * 0.46) or left < 2 or right + 2 >= len(path):
+        return []
+    indices = [left - 2, left - 1, left, right, right + 1, right + 2]
+    if any(path[i].point is None or path[i].source not in ("head", "manual") for i in indices):
+        return []
+    points = np.asarray([path[i].point for i in indices], dtype=float)
+    average = (points[3] - points[2]) / (right - left)
+    speed = float(np.linalg.norm(average))
+    if speed == 0 or speed > 1.85 * diagonal / fps:
+        return []
+    approach = (points[2] - points[0]) / 2
+    departure = (points[5] - points[3]) / 2
+    for velocity in (approach, departure):
+        forward_speed = float(np.dot(velocity, average) / speed)
+        if not 0.45 * speed <= forward_speed <= 1.7 * speed:
+            return []
+        if forward_speed < 0.88 * np.linalg.norm(velocity):
+            return []
+    return indices
+
+
 def smooth_path(path: list[Sample], fps: float, width: int, height: int) -> list[Sample]:
     """Smooth in contiguous stretches while leaving clicked positions exact."""
     updated = list(path)
@@ -67,19 +90,20 @@ def smooth_path(path: list[Sample], fps: float, width: int, height: int) -> list
         gap = right - left - 1
         between = path[left + 1:right]
         confirmed_ends = path[left].source == path[right].source == "manual"
-        gap_limit = max(max_gap, round(fps * 0.36)) if confirmed_ends else max_gap
-        if not 0 < gap <= gap_limit or any(sample.source == "excluded" for sample in between):
+        if gap <= 0 or any(sample.source == "excluded" for sample in between):
             continue
         start, end = np.array(path[left].point), np.array(path[right].point)
-        if np.linalg.norm(end - start) > diagonal * (0.55 if confirmed_ends else 0.16):
-            continue
-
-        # Preserve the curvature supported by the adjacent observed positions.
-        indices = [left, right]
-        if left and path[left - 1].point is not None:
-            indices.insert(0, left - 1)
-        if right + 1 < len(path) and path[right + 1].point is not None:
-            indices.append(right + 1)
+        gap_limit = max(max_gap, round(fps * 0.36)) if confirmed_ends else max_gap
+        if gap <= gap_limit and np.linalg.norm(end - start) <= diagonal * (0.55 if confirmed_ends else 0.16):
+            indices = [left, right]
+            if left and path[left - 1].point is not None:
+                indices.insert(0, left - 1)
+            if right + 1 < len(path) and path[right + 1].point is not None:
+                indices.append(right + 1)
+        else:
+            indices = motion_support(path, left, right, fps, diagonal)
+            if not indices:
+                continue
         interpolate = PchipInterpolator(indices, [path[i].point for i in indices], axis=0)
         for i in range(left + 1, right):
             updated[i] = Sample(tuple(np.rint(interpolate(i)).astype(int)), "interpolated", True)

@@ -161,6 +161,7 @@ with st.container():
         896: "高精度（未検出のコマを再解析）", 640: "標準", 480: "高速",
     }[size], horizontal=True)
     st.caption("高精度モードは処理に時間がかかります。まずは短いスイング動画でお試しください。")
+    auto_export = st.checkbox("解析後に軌道付きMP4も自動で作成", value=True)
     loaded = st.session_state.get("job")
     if st.button("自動追跡する", disabled=upload is None, type="primary"):
         try:
@@ -171,6 +172,7 @@ with st.container():
             if loaded is not None:
                 loaded["temp"].cleanup()
                 st.session_state.pop(f"frame_{loaded['id']}", None)
+            new_job["auto_export_pending"] = auto_export
             st.session_state.job = new_job
 
 job = st.session_state.get("job")
@@ -191,13 +193,16 @@ manual_count = sum(sample.source == "manual" for sample in path)
 frame_key = f"frame_{job['id']}"
 index = st.session_state.get(frame_key, 1) - 1
 current = path[index]
+review_sample = render_path[index] if current.source == "missing" else current
 st.divider()
 st.subheader("コマを確認・修正")
 st.caption(f"{job['filename']} · {info.frames:,}コマ · {info.fps:g} fps · 要確認 {len(suspects):,} · 手動修正 {manual_count:,}")
 direct = sum(sample.source == "head" for sample in path)
 estimated = sum(sample.source in ("shaft", "interpolated") for sample in path)
-missing = sum(sample.source == "missing" for sample in path)
-st.caption(f"ヘッド直接検出 {direct:,} · シャフト推定・補間 {estimated:,} · 未検出 {missing:,}")
+missing = sum(sample.source == "missing" for sample in render_path[:end + 1])
+auto_filled = sum(before.point is None and after.point is not None
+                  for before, after in zip(path[:end + 1], render_path[:end + 1]))
+st.caption(f"ヘッド直接検出 {direct:,} · シャフト推定・補間 {estimated:,} · 追加補間 {auto_filled:,} · 未検出 {missing:,}")
 if all(sample.point is None for sample in path):
     hint = ("高精度モードで再解析するか、" if job.get("image_size", 640) < 896 else "")
     st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
@@ -213,7 +218,7 @@ for column, label, target in zip(nav, ("前の要確認", "前のコマ", "次�
 
 if info.frames > 1:
     st.slider("コマ番号", 1, info.frames, key=frame_key)
-st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[current.source]}"
+st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[review_sample.source]}"
            + ("（要確認）" if current.suspect else ""))
 st.write("画像上のクラブヘッドの中心をクリックして修正します。短い検出漏れは、前後の見えるコマをクリックすると補間できます。")
 
@@ -261,7 +266,7 @@ seek_controls[1].button("終了点を確認", on_click=move_to,
 
 try:
     jpeg = preview_jpeg(job["source"], render_path, index, show_trail,
-                        split=split, end=end, review_sample=current)
+                        split=split, end=end, review_sample=review_sample)
 except RuntimeError as error:
     st.error(str(error))
     st.stop()
@@ -281,7 +286,12 @@ if event and event.get("token") == token and event.get("id") != job["click"]:
 st.divider()
 st.subheader("軌道付き動画")
 st.caption("描画終了後も、それまでの軌道を残した状態で動画が最後まで再生されます。")
-if st.button("軌道付きMP4を作成", type="primary", disabled=all(p.point is None for p in render_path[:end + 1])):
+if missing:
+    st.caption(f"描画範囲内に補間できなかったコマが {missing:,} 枚あります。")
+can_export = any(p.point is not None for p in render_path[:end + 1])
+requested = st.button("軌道付きMP4を作成", type="primary", disabled=not can_export)
+auto_requested = job.pop("auto_export_pending", False)
+if can_export and (auto_requested or requested):
     target = job["source"].with_name("swingtrace.mp4")
     progress = st.progress(0, text="軌道付き動画を書き出しています…")
     try:
