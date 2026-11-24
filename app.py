@@ -11,7 +11,10 @@ import streamlit.components.v1 as components
 
 from tracking import Detector, estimate_path
 from trajectory import estimate_timing, render_trajectory
-from video_io import MAX_FRAMES, MAX_SECONDS, analyze, export_video, normalize, preview_jpeg
+from video_io import (
+    DEFAULT_TRAIL_STYLE, MAX_FRAMES, MAX_SECONDS, TrailStyle,
+    analyze, export_video, normalize, preview_jpeg,
+)
 
 st.set_page_config(page_title="SwingTrace クラブヘッド追跡", page_icon="⛳", layout="wide")
 
@@ -168,6 +171,14 @@ with st.container():
             "follow": "隠れた区間も補間してフォローまで",
         }[value], horizontal=True, key="drawing_scope",
     )
+    with st.expander("軌道線の色と太さ"):
+        colors = st.columns(2)
+        before_color = colors[0].color_picker("切り替え前の色", DEFAULT_TRAIL_STYLE.before)
+        after_color = colors[1].color_picker("切り替え後の色", DEFAULT_TRAIL_STYLE.after)
+        thickness = st.slider("線の太さ（短辺1080px換算）", 1, 16, DEFAULT_TRAIL_STYLE.thickness,
+                              format="%d px")
+    style = TrailStyle(before_color, after_color, thickness)
+    style_key = (style.before, style.after, style.thickness)
     auto_export = st.checkbox("解析後に軌道付きMP4も自動で作成", value=True)
     loaded = st.session_state.get("job")
     if st.button("自動追跡する", disabled=upload is None, type="primary"):
@@ -181,6 +192,7 @@ with st.container():
                 st.session_state.pop(f"frame_{loaded['id']}", None)
             new_job["auto_export_pending"] = auto_export
             new_job["drawing_scope"] = scope
+            new_job["trail_style"] = style_key
             st.session_state.job = new_job
 
 job = st.session_state.get("job")
@@ -194,6 +206,14 @@ if job.get("drawing_scope", "stop") != scope:
     invalidate_export(job)
     job["drawing_scope"] = scope
     job["auto_export_pending"] = auto_export
+
+if job.get("trail_style") != style_key:
+    old_style = job.get("trail_style")
+    job["trail_style"] = style_key
+    if old_style is not None:
+        invalidate_export(job)
+        if not job.get("auto_export_pending"):
+            job["style_changed"] = True
 
 include_follow = scope == "follow"
 end_key = "follow_end" if include_follow else "end"
@@ -254,9 +274,9 @@ if controls[2].button("このコマの修正を戻す", disabled=index not in jo
 
 st.subheader("軌道の色と描画範囲")
 if split is None:
-    st.caption("切り替え点を指定すると、そこまでが青、その後が赤になります。")
+    st.caption("切り替え点を指定すると、そこから後半の色に変わります。")
 else:
-    st.caption(f"青 → 赤　{split + 1:,}コマ目（{split / info.fps:.2f}秒）"
+    st.caption(f"色の切り替え　{split + 1:,}コマ目（{split / info.fps:.2f}秒）"
                f"{' ・ 自動候補' if job.get('split') is None else ''}")
 end_label = ""
 if manual_end is None:
@@ -265,7 +285,7 @@ if include_follow and suggestion.occlusion_found and last_seen <= suggestion.end
     st.caption("ヘッドが再び見えるコマを検出できた場合に、フォローまで描画します。")
 st.caption(f"描画終了　{end + 1:,}コマ目（{end / info.fps:.2f}秒）{end_label}")
 timing = st.columns(3)
-if timing[0].button("このコマで青 → 赤", disabled=index >= end, width="stretch"):
+if timing[0].button("このコマで色を切り替える", disabled=index >= end, width="stretch"):
     job["split"] = index
     invalidate_export(job)
     st.rerun()
@@ -288,7 +308,7 @@ seek_controls[1].button("終了点を確認", on_click=move_to,
 
 try:
     jpeg = preview_jpeg(job["source"], render_path, index, show_trail,
-                        split=split, end=end, review_sample=review_sample)
+                        split=split, end=end, review_sample=review_sample, style=style)
 except RuntimeError as error:
     st.error(str(error))
     st.stop()
@@ -320,13 +340,16 @@ if can_export and (auto_requested or requested):
         export_video(
             job["source"], info, render_path, target,
             lambda done, total: progress.progress(done / total, text=f"MP4作成中 · {done:,} / {total:,} コマ"),
-            split=split, end=end,
+            split=split, end=end, style=style,
         )
         job["export"] = target
+        job.pop("style_changed", None)
     except Exception as error:
         st.error(f"MP4を作成できませんでした。{error}")
     finally:
         progress.empty()
+if job.get("style_changed") and job["export"] is None:
+    st.caption("現在の色と太さで保存するには「軌道付きMP4を作成」を押してください。")
 if job["export"] is not None:
     st.video(str(job["export"]), format="video/mp4")
     with job["export"].open("rb") as finished:
