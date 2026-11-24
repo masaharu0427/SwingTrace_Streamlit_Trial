@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.interpolate import CubicSpline, PchipInterpolator
+from scipy.sparse import diags
+from scipy.sparse.linalg import spsolve
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 
@@ -57,73 +59,78 @@ def estimate_timing(path: list[Sample], fps: float, height: int) -> Timing:
     return fallback
 
 
-def motion_support(path: list[Sample], left: int, right: int, fps: float, diagonal: float) -> list[int]:
-    """Return boundary observations for a longer gap when motion is consistent."""
-    if right - left - 1 > round(fps * 0.46) or left < 2 or right + 2 >= len(path):
-        return []
-    indices = [left - 2, left - 1, left, right, right + 1, right + 2]
-    if any(path[i].point is None or path[i].source not in ("head", "manual") for i in indices):
-        return []
-    points = np.asarray([path[i].point for i in indices], dtype=float)
-    average = (points[3] - points[2]) / (right - left)
-    speed = float(np.linalg.norm(average))
-    if speed == 0 or speed > 1.85 * diagonal / fps:
-        return []
-    approach = (points[2] - points[0]) / 2
-    departure = (points[5] - points[3]) / 2
-    for velocity in (approach, departure):
-        forward_speed = float(np.dot(velocity, average) / speed)
-        if not 0.45 * speed <= forward_speed <= 1.7 * speed:
-            return []
-        if forward_speed < 0.88 * np.linalg.norm(velocity):
-            return []
-    return indices
-
-
-def smooth_path(path: list[Sample], fps: float, width: int, height: int) -> list[Sample]:
-    """Smooth in contiguous stretches while leaving clicked positions exact."""
+def smooth_path(path: list[Sample], fps: float, width: int, height: int, end: int) -> list[Sample]:
+    """Fit a smooth curve to detected points within the chosen drawing range."""
     updated = list(path)
-    valid = [i for i, sample in enumerate(path) if sample.point is not None]
-    max_gap = max(1, round(fps * 0.16))
-    diagonal = float(np.hypot(width, height))
-    for left, right in zip(valid, valid[1:]):
-        gap = right - left - 1
-        between = path[left + 1:right]
-        confirmed_ends = path[left].source == path[right].source == "manual"
-        if gap <= 0 or any(sample.source == "excluded" for sample in between):
+    stop = min(end + 1, len(path))
+    breaks = [-1, *(i for i in range(stop) if path[i].source == "excluded"), stop]
+    for start, finish in zip(breaks, breaks[1:]):
+        known = [i for i in range(start + 1, finish) if path[i].point is not None]
+        if len(known) < 2:
             continue
-        start, end = np.array(path[left].point), np.array(path[right].point)
-        gap_limit = max(max_gap, round(fps * 0.36)) if confirmed_ends else max_gap
-        if gap <= gap_limit and np.linalg.norm(end - start) <= diagonal * (0.55 if confirmed_ends else 0.16):
-            indices = [left, right]
-            if left and path[left - 1].point is not None:
-                indices.insert(0, left - 1)
-            if right + 1 < len(path) and path[right + 1].point is not None:
-                indices.append(right + 1)
+        first, last = known[0], known[-1]
+        frames = np.arange(first, last + 1)
+        observed = np.asarray([path[i].point for i in known], dtype=float)
+        if len(known) < 3 or len(frames) < 4:
+            fitted = PchipInterpolator(known, observed, axis=0)(frames)
         else:
-            indices = motion_support(path, left, right, fps, diagonal)
-            if not indices:
+            fitted = fit_points(path, known, frames, observed, fps, float(np.hypot(width, height)))
+        fitted = np.rint(np.clip(fitted, [0, 0], [width - 1, height - 1])).astype(int)
+        for index, point in zip(frames, fitted):
+            original = path[index]
+            if original.source == "manual":
                 continue
-        interpolate = PchipInterpolator(indices, [path[i].point for i in indices], axis=0)
-        for i in range(left + 1, right):
-            updated[i] = Sample(tuple(np.rint(interpolate(i)).astype(int)), "interpolated", True)
-
-    active = np.array([i for i, sample in enumerate(updated) if sample.point is not None])
-    for group in np.split(active, np.flatnonzero(np.diff(active) > 1) + 1):
-        if len(group) < 3:
-            continue
-        original = np.asarray([updated[i].point for i in group], dtype=float)
-        filtered = gaussian_filter1d(original, np.clip(fps * 0.047, 0.85, 3.5), axis=0)
-        for offset, i in enumerate(group[1:-1], 1):
-            sample = updated[i]
-            if sample.source == "manual":
-                continue
-            delta = filtered[offset] - original[offset]
-            limit = diagonal * (0.009 if sample.suspect else 0.0045)
-            scale = min(1.0, limit / max(float(np.linalg.norm(delta)), 1e-9))
-            point = original[offset] + delta * scale
-            updated[i] = Sample(tuple(np.rint(point).astype(int)), sample.source, sample.suspect)
+            updated[index] = Sample(tuple(map(int, point)), original.source, original.suspect) if original.point is not None else (
+                Sample(tuple(map(int, point)), "interpolated", True)
+            )
     return updated
+
+
+def fit_points(path, known, frames, observed, fps, diagonal):
+    first, count = int(frames[0]), len(frames)
+    local_known = np.asarray(known) - first
+    observations = np.zeros((count, 2))
+    observations[local_known] = observed
+    weights = np.zeros(count)
+    for index in known:
+        sample = path[index]
+        weights[index - first] = (
+            (0.55 if sample.suspect else 1.0) if sample.source == "head" else
+            0.25 if sample.source == "shaft" else 0.08
+        )
+    # Trust observed head positions more where fast motion is visible in successive frames.
+    frame_steps = np.diff(local_known)
+    speeds = np.linalg.norm(np.diff(observed, axis=0), axis=1) / frame_steps
+    speeds[frame_steps != 1] = 0
+    adjacent_speed = np.maximum(np.r_[0, speeds], np.r_[speeds, 0])
+    for offset, index in enumerate(known):
+        if path[index].source == "head":
+            boost = 1 + 8 * min(1, (adjacent_speed[offset] * fps / diagonal) ** 2)
+            weights[index - first] *= boost
+    base_weights = weights.copy()
+
+    # Fix the visible endpoints and all corrections without resampling the clicks.
+    fixed = sorted({0, count - 1, *(i - first for i in known if path[i].source == "manual")})
+    free = np.setdiff1d(np.arange(count), fixed, assume_unique=True)
+    points = observations.copy()
+    if not len(free):
+        return points
+
+    difference = diags([-1., 3., -3., 1.], [0, 1, 2, 3],
+                       shape=(count - 3, count), format="csc")
+    strength = 110 * np.clip(fps / 30, 0.65, 6) ** 6
+    stiffness = strength * (difference.T @ difference)
+    fixed_term = stiffness[free, :][:, fixed] @ points[fixed]
+    free_stiffness = stiffness[free, :][:, free]
+
+    for _ in range(2):
+        system = free_stiffness + diags(weights[free], format="csc")
+        points[free] = spsolve(system, weights[free, None] * observations[free] - fixed_term)
+        # A detection that briefly moves from the center to the heel should not bend the path.
+        residual = np.linalg.norm(points[free] - observations[free], axis=1)
+        robust = np.clip(diagonal * 0.012 / np.maximum(residual, 1e-6), 0.60, 1.0)
+        weights[free] = base_weights[free] * robust
+    return points
 
 
 def curve_segments(path: list[Sample], end: int, width: int, height: int) -> dict[int, np.ndarray]:
@@ -137,9 +144,5 @@ def curve_segments(path: list[Sample], end: int, width: int, height: int) -> dic
         curve = CubicSpline(group, points, axis=0, bc_type="natural")
         for i in group[1:]:
             vertices = curve(np.linspace(i - 1, i, 10))
-            # Limit spline overshoot around sharp turns.
-            pair = points[i - group[0] - 1:i - group[0] + 1]
-            lo = np.maximum(pair.min(axis=0) - 3, 0)
-            hi = np.minimum(pair.max(axis=0) + 3, [width - 1, height - 1])
-            curves[int(i)] = np.rint(np.clip(vertices, lo, hi) * 16).astype(np.int32)
+            curves[int(i)] = np.rint(np.clip(vertices, [0, 0], [width - 1, height - 1]) * 16).astype(np.int32)
     return curves

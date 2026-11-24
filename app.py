@@ -181,10 +181,10 @@ if job is None:
 
 info = job["info"]
 path = estimate_path(job["detections"], job["corrections"], info.fps, info.width, info.height)
-render_path = smooth_path(path, info.fps, info.width, info.height)
-suggestion = estimate_timing(render_path, info.fps, info.height)
+suggestion = estimate_timing(path, info.fps, info.height)
 end = job.get("end")
 end = suggestion.end if end is None else end
+render_path = smooth_path(path, info.fps, info.width, info.height, end)
 split = job.get("split")
 split = suggestion.split if split is None else split
 split = split if split is not None and split <= end else None
@@ -202,7 +202,7 @@ estimated = sum(sample.source in ("shaft", "interpolated") for sample in path)
 missing = sum(sample.source == "missing" for sample in render_path[:end + 1])
 auto_filled = sum(before.point is None and after.point is not None
                   for before, after in zip(path[:end + 1], render_path[:end + 1]))
-st.caption(f"ヘッド直接検出 {direct:,} · シャフト推定・補間 {estimated:,} · 追加補間 {auto_filled:,} · 未検出 {missing:,}")
+st.caption(f"ヘッド直接検出 {direct:,} · シャフト推定・補間 {estimated:,} · 曲線で補間 {auto_filled:,} · 未検出 {missing:,}")
 if all(sample.point is None for sample in path):
     hint = ("高精度モードで再解析するか、" if job.get("image_size", 640) < 896 else "")
     st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
@@ -220,7 +220,7 @@ if info.frames > 1:
     st.slider("コマ番号", 1, info.frames, key=frame_key)
 st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[review_sample.source]}"
            + ("（要確認）" if current.suspect else ""))
-st.write("画像上のクラブヘッドの中心をクリックして修正します。短い検出漏れは、前後の見えるコマをクリックすると補間できます。")
+st.write("画像上のクラブヘッドの中心をクリックして修正します。描画範囲内で検出が途切れた部分は自動で曲線をつなぎます。")
 
 controls = st.columns(3)
 show_trail = controls[0].checkbox("確認画像に軌道を表示", value=True)
@@ -285,7 +285,7 @@ if event and event.get("token") == token and event.get("id") != job["click"]:
 
 st.divider()
 st.subheader("軌道付き動画")
-st.caption("描画終了後も、それまでの軌道を残した状態で動画が最後まで再生されます。")
+st.caption("描画範囲内の未検出区間は前後の動きから推定します。描画終了後も軌道を表示したまま再生します。")
 if missing:
     st.caption(f"描画範囲内に補間できなかったコマが {missing:,} 枚あります。")
 can_export = any(p.point is not None for p in render_path[:end + 1])
