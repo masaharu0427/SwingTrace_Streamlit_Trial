@@ -612,7 +612,9 @@ manual_count = sum(sample.source == "manual" for sample in path)
 frame_key = f"frame_{job['id']}"
 index = st.session_state.get(frame_key, 1) - 1
 current = path[index]
-review_sample = render_path[index] if current.source == "missing" else current
+preview_end = end if end >= 0 else last_seen
+preview_path = render_path if end >= 0 else path
+review_sample = preview_path[index] if current.source == "missing" else current
 st.divider()
 st.subheader("コマを確認・修正")
 st.caption(f"{job['filename']} · {info.frames:,}コマ · {info.fps:g} fps · 要確認 {len(suspects):,} · 手動修正 {manual_count:,}")
@@ -626,10 +628,14 @@ if all(sample.point is None for sample in path):
     hint = ("高精度モードで再解析するか、" if job.get("image_size", 640) < 896 else "")
     st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
 
-show_trail = st.session_state.get("review_show_trail", True)
+show_trail = st.checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
+if show_trail and end < 0 and any(sample.point is not None for sample in path):
+    st.caption("描画終了点を設定するまでは、確認画像に検出済みの軌道を表示します。")
+# Keep the line visible when the review image is reduced to phone width.
+preview_style = TrailStyle(style.before, style.after, style.thickness + 4)
 try:
-    jpeg = preview_jpeg(job["source"], render_path, index, show_trail,
-                        split=split, end=end, review_sample=review_sample, style=style)
+    jpeg = preview_jpeg(job["source"], preview_path, index, show_trail,
+                        split=split, end=preview_end, review_sample=review_sample, style=preview_style)
 except RuntimeError as error:
     st.error(str(error))
 else:
@@ -659,12 +665,11 @@ st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒
            + ("（要確認）" if current.suspect else ""))
 st.write("画像上のクラブヘッドの中心をクリックして修正します。描画範囲内で検出が途切れた部分は自動で曲線をつなぎます。")
 
-controls = st.columns(3)
-controls[0].checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
-if controls[1].button("このコマを除外", disabled=current.source == "excluded", width="stretch"):
+controls = st.columns(2)
+if controls[0].button("このコマを除外", disabled=current.source == "excluded", width="stretch"):
     edit(job, index, None)
     st.rerun()
-if controls[2].button("このコマの修正を戻す", disabled=index not in job["corrections"], width="stretch"):
+if controls[1].button("このコマの修正を戻す", disabled=index not in job["corrections"], width="stretch"):
     del job["corrections"][index]
     invalidate_export(job)
     st.rerun()
