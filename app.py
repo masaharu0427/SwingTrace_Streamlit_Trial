@@ -500,7 +500,7 @@ def request_follow_export() -> None:
     st.session_state["job"]["follow_export_requested"] = True
 
 
-def apply_review_event() -> None:
+def apply_review_event(advance_to: int | None = None) -> None:
     job = st.session_state["job"]
     job_id = job["id"]
     event = st.session_state.get(f"click_{job_id}")
@@ -520,6 +520,8 @@ def apply_review_event() -> None:
     x, y = event.get("x"), event.get("y")
     if all(type(value) in (int, float) and 0 <= value <= 1 for value in (x, y)):
         edit(job, index, (round(x * (info.width - 1)), round(y * (info.height - 1))))
+        if advance_to == index + 2:
+            move_to(frame_key, advance_to)
 
 
 with st.container():
@@ -637,6 +639,17 @@ if not has_tracking:
     st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
 
 show_trail = st.checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
+advance = st.checkbox(
+    "ヘッドを修正したら、隣の要確認コマへ進む", key=f"advance_review_{job['id']}",
+    help="隣のコマが未検出・推定などの場合だけ進みます。描画終了コマを指定すると、そこで止まります。",
+)
+next_index = index + 1
+advance_to = (
+    next_index + 1
+    if advance and current.suspect and next_index < info.frames
+    and path[next_index].suspect and (manual_end is None or next_index <= manual_end)
+    else None
+)
 if show_trail and end < 0 and has_tracking:
     st.caption("描画終了点を設定するまでは、確認画像に検出済みの軌道を表示します。")
 # Keep the line visible when the review image is reduced to phone width.
@@ -650,7 +663,8 @@ else:
     click_frame(
         image=b64encode(jpeg).decode("ascii"), token=f"{job['id']}:{index}",
         frame=index + 1, total_frames=info.frames, ack=job.get("review_ack"),
-        aspect=info.width / info.height, key=f"click_{job['id']}", on_change=apply_review_event,
+        aspect=info.width / info.height, key=f"click_{job['id']}",
+        on_change=lambda: apply_review_event(advance_to),
     )
 
 if info.frames > 1:
@@ -663,6 +677,12 @@ if info.frames > 1:
             on_change=lambda: move_to(frame_key, st.session_state[slider_key]),
         )
 
+next_missing = next((i for i in range(index + 1, info.frames) if path[i].source == "missing"), None)
+if next_missing is not None:
+    st.button(
+        f"次の未検出へ（{next_missing + 1:,}コマ）", on_click=move_to,
+        args=(frame_key, next_missing + 1), width="stretch",
+    )
 if end < 0 and has_tracking:
     st.info("ヘッドが体に隠れる位置を特定できませんでした。フォローまで補間してMP4を作成するか、プレビューで終了コマを選べます。")
     st.button("フォローまで補間してMP4を作成", on_click=request_follow_export, width="stretch")
