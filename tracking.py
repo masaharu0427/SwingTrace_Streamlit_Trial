@@ -108,8 +108,6 @@ class Detector:
         if image_size <= 640:
             return base
 
-        # Keep the original detections as anchors so retries cannot propagate a false hit.
-        anchors = [d.head if d.confidence >= 0.50 else None for d in base]
         missing = [i for i, detection in enumerate(base) if detection.confidence < STRONG_HEAD]
         for start in range(0, len(missing), 2):
             indices = missing[start:start + 2]
@@ -118,24 +116,18 @@ class Detector:
                 detected = base[i]
                 tip = secondary.shaft_tip or detected.shaft_tip
                 heads = detected.heads + secondary.heads
-                center = tip
-                if center is None:
-                    before = anchors[i - 1] if i > 0 else None
-                    after = anchors[i + 1] if i + 1 < len(anchors) else None
-                    if before is not None and after is not None:
-                        center = tuple(round((a + b) / 2) for a, b in zip(before, after))
-                if center is not None and max((score for _, score in heads), default=0) < STRONG_HEAD:
+                if tip is not None and max((score for _, score in heads), default=0) < STRONG_HEAD:
                     frame = frames[i]
                     height, width = frame.shape[:2]
                     crop_width = max(1, round(width * 0.52))
                     crop_height = max(1, round(height * 0.52))
-                    x = min(width - crop_width, max(0, center[0] - crop_width // 2))
-                    y = min(height - crop_height, max(0, center[1] - crop_height // 2))
+                    x = min(width - crop_width, max(0, tip[0] - crop_width // 2))
+                    y = min(height - crop_height, max(0, tip[1] - crop_height // 2))
                     crop = frame[y:y + crop_height, x:x + crop_width]
                     zoomed = self.infer([crop], 640, (x, y))[0]
                     radius = 0.10 * float(np.hypot(width, height))
                     heads += tuple((point, score) for point, score in zoomed.heads
-                                   if distance(point, center) <= radius)
+                                   if distance(point, tip) <= radius)
                 base[i] = make_detection(heads, tip, detected.shafts + secondary.shafts)
         return base
 
@@ -227,16 +219,18 @@ def estimate_path(
         if previous_pass[i].source != "missing":
             continue
         reference, tip = references[i], detection.shaft_tip
-        # Consecutive shaft guesses can lock onto the same background line.
-        tip_agrees = i in bracketed and tip is not None and distance(reference, tip) <= 0.045 * diagonal
+        adjacent_tips = [detections[j].shaft_tip for j in (i - 1, i + 1)
+                         if 0 <= j < len(path) and previous_pass[j].source != "excluded"]
+        tip_agrees = tip is not None and (
+            (reference is not None and distance(reference, tip) <= 0.15 * diagonal)
+            or any(other is not None and distance(tip, other) <= 0.12 * diagonal
+                   for other in adjacent_tips)
+        )
         candidates = [
             (point, score) for point, score in detection.heads
-            if reference is not None and (
-                distance(reference, point) <= 0.055 * diagonal
-                or (i in bracketed and score >= 0.18 and tip is not None
-                    and distance(tip, point) <= 0.025 * diagonal
-                    and distance(reference, point) <= 0.12 * diagonal)
-            )
+            if ((tip_agrees and distance(tip, point) <= 0.08 * diagonal)
+                or (reference is not None and distance(reference, point) <= 0.055 * diagonal))
+            and (reference is None or distance(reference, point) <= 0.18 * diagonal)
         ]
         if candidates:
             point, _ = max(candidates, key=lambda hit: hit[1])
@@ -247,35 +241,18 @@ def estimate_path(
             corners = [(x, y) for x1, y1, x2, y2 in detection.shafts
                        for x in (x1, x2) for y in (y1, y2)]
             closest = min(corners, key=lambda corner: distance(reference, corner))
-            if distance(reference, closest) <= 0.03 * diagonal:
+            if distance(reference, closest) <= 0.055 * diagonal:
                 path[i] = Sample(clip(closest), "shaft", True)
 
     gap_span = max(1, round(fps * 0.14))
     anchors = [i for i, sample in enumerate(path) if sample.point is not None or sample.source == "excluded"]
     for left, right in zip(anchors, anchors[1:]):
         first, last = path[left].point, path[right].point
-        span = right - left
-        if first is None or last is None or not 1 < span <= gap_span + 1:
+        if first is None or last is None or right - left > gap_span + 1:
             continue
-        if distance(first, last) > diagonal * min(0.34, span * 0.11):
-            # Fast, short gaps can still be joined when both sides show the same motion.
-            before = path[left - 1].point if left > 0 else None
-            after = path[right + 1].point if right + 1 < len(path) else None
-            if (before is None or after is None or path[left].source not in ("head", "manual")
-                    or path[right].source not in ("head", "manual")
-                    or distance(first, last) > 0.43 * diagonal):
-                continue
-            gap_velocity = (np.asarray(last) - first) / span
-            entry_velocity = np.asarray(first) - before
-            exit_velocity = np.asarray(after) - last
-            speed = np.linalg.norm(gap_velocity)
-            if not all(
-                0.45 * speed <= np.linalg.norm(velocity) <= 2.2 * speed
-                and np.dot(velocity, gap_velocity) >= 0.8 * np.linalg.norm(velocity) * speed
-                for velocity in (entry_velocity, exit_velocity)
-            ):
-                continue
+        if distance(first, last) > diagonal * min(0.34, (right - left) * 0.11):
+            continue
         for index in range(left + 1, right):
-            point = interpolate(first, last, (index - left) / span)
+            point = interpolate(first, last, (index - left) / (right - left))
             path[index] = Sample(point, "interpolated", True)
     return path

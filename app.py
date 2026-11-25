@@ -500,7 +500,7 @@ def request_follow_export() -> None:
     st.session_state["job"]["follow_export_requested"] = True
 
 
-def apply_review_event(advance_to: int | None = None) -> None:
+def apply_review_event() -> None:
     job = st.session_state["job"]
     job_id = job["id"]
     event = st.session_state.get(f"click_{job_id}")
@@ -520,8 +520,6 @@ def apply_review_event(advance_to: int | None = None) -> None:
     x, y = event.get("x"), event.get("y")
     if all(type(value) in (int, float) and 0 <= value <= 1 for value in (x, y)):
         edit(job, index, (round(x * (info.width - 1)), round(y * (info.height - 1))))
-        if advance_to == index + 2:
-            move_to(frame_key, advance_to)
 
 
 with st.container():
@@ -639,17 +637,6 @@ if not has_tracking:
     st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
 
 show_trail = st.checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
-advance = st.checkbox(
-    "ヘッドを修正したら、隣の要確認コマへ進む", key=f"advance_review_{job['id']}",
-    help="隣のコマが未検出・推定などの場合だけ進みます。描画終了コマを指定すると、そこで止まります。",
-)
-next_index = index + 1
-advance_to = (
-    next_index + 1
-    if advance and current.suspect and next_index < info.frames
-    and path[next_index].suspect and (manual_end is None or next_index <= manual_end)
-    else None
-)
 if show_trail and end < 0 and has_tracking:
     st.caption("描画終了点を設定するまでは、確認画像に検出済みの軌道を表示します。")
 # Keep the line visible when the review image is reduced to phone width.
@@ -663,8 +650,7 @@ else:
     click_frame(
         image=b64encode(jpeg).decode("ascii"), token=f"{job['id']}:{index}",
         frame=index + 1, total_frames=info.frames, ack=job.get("review_ack"),
-        aspect=info.width / info.height, key=f"click_{job['id']}",
-        on_change=lambda: apply_review_event(advance_to),
+        aspect=info.width / info.height, key=f"click_{job['id']}", on_change=apply_review_event,
     )
 
 if info.frames > 1:
@@ -677,12 +663,6 @@ if info.frames > 1:
             on_change=lambda: move_to(frame_key, st.session_state[slider_key]),
         )
 
-next_missing = next((i for i in range(index + 1, info.frames) if path[i].source == "missing"), None)
-if next_missing is not None:
-    st.button(
-        f"次の未検出へ（{next_missing + 1:,}コマ）", on_click=move_to,
-        args=(frame_key, next_missing + 1), width="stretch",
-    )
 if end < 0 and has_tracking:
     st.info("ヘッドが体に隠れる位置を特定できませんでした。フォローまで補間してMP4を作成するか、プレビューで終了コマを選べます。")
     st.button("フォローまで補間してMP4を作成", on_click=request_follow_export, width="stretch")
@@ -700,9 +680,7 @@ for column, label, target in zip(nav, ("前の要確認", "次の要確認"), (p
                   args=(frame_key, target + 1) if target is not None else None, width="stretch")
 st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[review_sample.source]}"
            + ("（要確認）" if current.suspect else ""))
-if end >= 0 and index > end:
-    st.caption(f"軌道の描画範囲は{end + 1:,}コマ目までです。このコマの検出状態は上に表示しています。")
-st.write("画像上のクラブヘッドの中心をクリックして修正します。位置を絞れない区間は途切れたまま表示します。")
+st.write("画像上のクラブヘッドの中心をクリックして修正します。描画範囲内で検出が途切れた部分は自動で曲線をつなぎます。")
 
 controls = st.columns(2)
 if controls[0].button("このコマを除外", disabled=current.source == "excluded", width="stretch"):
@@ -748,7 +726,7 @@ if end >= 0:
 
 st.divider()
 st.subheader("軌道付き動画")
-st.caption("前後の動きから位置を推定できた区間をつなぎます。描画終了後も軌道を表示したまま再生します。")
+st.caption("描画範囲内の未検出区間は前後の動きから推定します。描画終了後も軌道を表示したまま再生します。")
 if missing:
     st.caption(f"描画範囲内に補間できなかったコマが {missing:,} 枚あります。")
 can_export = end >= 0 and any(p.point is not None for p in render_path[:end + 1])

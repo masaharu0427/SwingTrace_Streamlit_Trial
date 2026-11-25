@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.interpolate import CubicHermiteSpline, PchipInterpolator
+from scipy.interpolate import CubicHermiteSpline, CubicSpline, PchipInterpolator
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 from scipy.ndimage import gaussian_filter1d
@@ -106,8 +106,7 @@ def smooth_path(path: list[Sample], fps: float, width: int, height: int, end: in
     """Fit a smooth curve to detected points within the chosen drawing range."""
     updated = list(path)
     stop = min(end + 1, len(path))
-    # Tracking already interpolates supported short gaps. Leave unresolved frames open.
-    breaks = [start - 1, *(i for i in range(start, stop) if path[i].point is None), stop]
+    breaks = [start - 1, *(i for i in range(start, stop) if path[i].source == "excluded"), stop]
     for previous_break, finish in zip(breaks, breaks[1:]):
         known = [i for i in range(previous_break + 1, finish) if path[i].point is not None]
         if len(known) < 2:
@@ -185,7 +184,7 @@ def curve_segments(path: list[Sample], end: int, width: int, height: int) -> dic
         if len(group) < 2:
             continue
         points = np.array([path[i].point for i in group])
-        curve = PchipInterpolator(group, points, axis=0)
+        curve = CubicSpline(group, points, axis=0, bc_type="natural")
         for i in group[1:]:
             vertices = curve(np.linspace(i - 1, i, 10))
             curves[int(i)] = np.rint(np.clip(vertices, [0, 0], [width - 1, height - 1]) * 16).astype(np.int32)

@@ -136,7 +136,7 @@ class Trail:
             indices = np.nonzero(mask)
             opacity = mask[indices].astype(np.float32)[:, None] / 255.0
             frame[indices] = frame[indices] * (1 - opacity) + np.asarray(color) * opacity
-        if sample.point is None or (index > self.end and not review):
+        if sample.point is None or index > self.end:
             return
         color = self.colors[self.phase(index)]
         if review and sample.source == "manual":
