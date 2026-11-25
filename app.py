@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
+from hashlib import sha256
 from pathlib import Path
 import re
 from shutil import copyfileobj
@@ -271,14 +272,16 @@ CLICK_FRAME_HTML = r'''<!doctype html>
 
 
 @st.cache_resource(show_spinner=False)
-def click_frame_assets() -> tempfile.TemporaryDirectory:
+def click_frame_assets(html: str) -> tempfile.TemporaryDirectory:
     directory = tempfile.TemporaryDirectory(prefix="swingtrace-click-")
-    (Path(directory.name) / "index.html").write_text(CLICK_FRAME_HTML, encoding="utf-8")
+    (Path(directory.name) / "index.html").write_text(html, encoding="utf-8")
     return directory
 
 
+# Change the iframe URL when its HTML changes, including after a hot reload.
+review_version = sha256(CLICK_FRAME_HTML.encode("utf-8")).hexdigest()[:12]
 click_frame = components.declare_component(
-    "swingtrace_click_frame", path=click_frame_assets().name
+    f"swingtrace_click_frame_{review_version}", path=click_frame_assets(CLICK_FRAME_HTML).name
 )
 MAX_UPLOAD_MB = 200
 MOBILE_CHUNK_BYTES = 256 * 1024
@@ -635,6 +638,16 @@ else:
         frame=index + 1, total_frames=info.frames, ack=job.get("review_ack"),
         aspect=info.width / info.height, key=f"click_{job['id']}", on_change=apply_review_event,
     )
+
+if info.frames > 1:
+    slider_key = f"review_slider_{job['id']}"
+    if st.session_state.get(slider_key) != index + 1:
+        st.session_state[slider_key] = index + 1
+    with st.expander("プレビューの下でコマを調整"):
+        st.slider(
+            "コマ番号", 1, info.frames, key=slider_key,
+            on_change=lambda: move_to(frame_key, st.session_state[slider_key]),
+        )
 
 previous = next((i for i in reversed(suspects) if i < index), None)
 following = next((i for i in suspects if i > index), None)
