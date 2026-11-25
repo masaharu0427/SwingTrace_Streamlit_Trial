@@ -287,6 +287,7 @@ MAX_UPLOAD_MB = 200
 MOBILE_CHUNK_BYTES = 256 * 1024
 MOBILE_MAX_SECONDS = 60
 MOBILE_MAX_FPS = 60
+MOBILE_MAX_SIDE = 1920
 
 MOBILE_UPLOAD_HTML = r"""<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
 body{margin:0;font-family:Arial,'Yu Gothic',sans-serif;color:#19382c}*{box-sizing:border-box}.box{padding:12px;background:#f0f4ef;border:1px solid #cbd5c6;border-radius:8px}button{font:inherit;padding:12px;border:1px solid #9caf98;border-radius:6px;background:white;color:#19382c;cursor:pointer;margin:4px 4px 4px 0}button:disabled{opacity:.45;cursor:default}#send{background:#247052;color:white}#name{margin:10px 0;overflow-wrap:anywhere;font-weight:bold}#status{font-size:14px;line-height:1.6;white-space:pre-wrap}progress{width:100%;height:18px}small{display:block;margin:8px 0;color:#52644c;line-height:1.6}
@@ -415,13 +416,14 @@ def mobile_upload() -> MobileUpload | None:
 
 
 def normalize_mobile(source: Path, output: Path) -> VideoInfo:
-    # Match the working golf-swing-python import profile while retaining audio for export.
-    scale = ("scale=w='min(960,iw)':h='min(960,ih)':force_original_aspect_ratio=decrease:"
+    # Preserve the detail available to the high-resolution and shaft-crop detection passes.
+    scale = (f"scale=w='min({MOBILE_MAX_SIDE},iw)':h='min({MOBILE_MAX_SIDE},ih)':"
+             "force_original_aspect_ratio=decrease:"
              f"force_divisible_by=2,setsar=1,fps='min(source_fps,{MOBILE_MAX_FPS})'")
     run_ffmpeg([
         "-nostdin", "-threads", "2", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
         "-t", str(MOBILE_MAX_SECONDS + 1), "-filter_threads", "2", "-vf", scale,
-        "-c:v", "libx264", "-threads:v", "2", "-preset", "veryfast", "-crf", "20",
+        "-c:v", "libx264", "-threads:v", "2", "-preset", "veryfast", "-crf", "16",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(output),
     ])
     with open_video(output) as capture:
@@ -528,7 +530,7 @@ with st.container():
     if method == "Android向け（分割送信）":
         upload = mobile_upload()
         st.caption(f"上限{MAX_UPLOAD_MB} MB・{MOBILE_MAX_SECONDS}秒。"
-                   f"解析用の動画は長辺960 px・最大{MOBILE_MAX_FPS} fpsに調整します。")
+                   f"解析用の映像は長辺{MOBILE_MAX_SIDE:,} px・最大{MOBILE_MAX_FPS} fpsです。")
     else:
         st.session_state.pop("swingtrace_mobile_import", None)
         upload = st.file_uploader("動画を選択", type=None)
@@ -545,7 +547,7 @@ with st.container():
     image_size = st.radio("追跡モード", [896, 640, 480], format_func=lambda size: {
         896: "高精度（未検出のコマを再解析）", 640: "標準", 480: "高速",
     }[size], horizontal=True)
-    st.caption("高精度モードは処理に時間がかかります。まずは短いスイング動画でお試しください。")
+    st.caption("通常速度の動画は高精度モードで解析できます。ヘッドがぼける場合は、明るい場所で60 fpsで撮影すると確認しやすくなります。")
     scope = st.radio(
         "軌道の描画範囲", ("stop", "follow"),
         format_func=lambda value: {
