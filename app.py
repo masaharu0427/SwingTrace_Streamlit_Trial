@@ -152,25 +152,93 @@ CLICK_FRAME_HTML = r'''<!doctype html>
 <title>修正するクラブヘッドの位置</title>
 <style>
   html, body { margin: 0; }
-  #frame { position: relative; margin: 0 auto; width: 100%; line-height: 0; }
+  #frame { position: relative; margin: 0 auto; width: 100%; }
   img { display: block; width: 100%; cursor: crosshair; touch-action: manipulation;
         user-select: none; border-radius: 7px; }
+  #review-controls { position: absolute; inset: 6px 6px auto; box-sizing: border-box;
+                     color: #fff; background: rgba(16, 25, 24, .86); border-radius: 7px;
+                     padding: 2px 6px 4px; font: 14px system-ui, sans-serif; }
+  #review-controls.bottom { inset: auto 6px 6px; }
+  #review-controls[hidden] { display: none; }
+  .review-row { display: flex; align-items: center; gap: 6px; }
+  .review-status { justify-content: space-between; min-height: 30px; padding-left: 4px; }
+  button { min-width: 44px; min-height: 38px; border: 1px solid #889d94;
+           border-radius: 5px; color: inherit; background: #293c35; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  #move-controls { min-height: 30px; border: 0; background: transparent; }
+  #position { flex: 1; min-width: 0; margin: 0; height: 38px;
+              accent-color: #9aefc9; cursor: pointer; touch-action: none; }
+  @media (pointer: coarse) {
+    button, #position { min-height: 44px; }
+  }
 </style>
-<div id="frame"><img id="photo" alt="スイング動画の確認コマ" draggable="false"></div>
+<div id="frame">
+  <img id="photo" alt="スイング動画の確認コマ" draggable="false">
+  <div id="review-controls" role="group" aria-label="コマの移動" hidden>
+    <div class="review-row review-status">
+      <span id="frame-number"></span>
+      <button id="move-controls" type="button" aria-label="操作バーを下へ移動">下へ</button>
+    </div>
+    <div class="review-row">
+      <button id="previous" type="button" aria-label="前のコマ">◀</button>
+      <input id="position" type="range" min="1" step="1" aria-label="コマ番号">
+      <button id="next" type="button" aria-label="次のコマ">▶</button>
+    </div>
+  </div>
+</div>
 <script>
   const photo = document.getElementById("photo");
   const frame = document.getElementById("frame");
+  const controls = document.getElementById("review-controls");
+  const position = document.getElementById("position");
+  const number = document.getElementById("frame-number");
+  const previous = document.getElementById("previous");
+  const next = document.getElementById("next");
+  const moveControls = document.getElementById("move-controls");
   let token = null;
   let ready = false;
+  let currentFrame = 1;
+  let pendingSeek = null;
   const send = (type, fields = {}) =>
     window.parent.postMessage({ isStreamlitMessage: true, type, ...fields }, "*");
+  const sendValue = (value) =>
+    send("streamlit:setComponentValue", { dataType: "json", value });
+  const eventId = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
   const resize = () => send("streamlit:setFrameHeight", {
     height: Math.ceil(frame.getBoundingClientRect().height) + 1
+  });
+  function updateControls() {
+    number.textContent = position.value + " / " + position.max + " コマ";
+    previous.disabled = Number(position.value) <= 1;
+    next.disabled = Number(position.value) >= Number(position.max);
+  }
+  function seek(target) {
+    if (token === null) return;
+    position.value = target;
+    updateControls();
+    if (pendingSeek === null && Number(position.value) === currentFrame) return;
+    pendingSeek = eventId();
+    sendValue({ kind: "seek", id: pendingSeek, frame: Number(position.value) });
+  }
+  position.addEventListener("input", updateControls);
+  position.addEventListener("change", () => seek(position.value));
+  previous.addEventListener("click", () => seek(Number(position.value) - 1));
+  next.addEventListener("click", () => seek(Number(position.value) + 1));
+  moveControls.addEventListener("click", () => {
+    const direction = controls.classList.toggle("bottom") ? "上へ" : "下へ";
+    moveControls.textContent = direction;
+    moveControls.setAttribute("aria-label", "操作バーを" + direction + "移動");
   });
 
   window.addEventListener("message", ({ source, data }) => {
     if (source !== window.parent || data?.type !== "streamlit:render") return;
     const args = data.args;
+    currentFrame = args.frame;
+    position.max = args.total_frames;
+    controls.hidden = args.total_frames < 2;
+    if (args.ack === pendingSeek) pendingSeek = null;
+    if (pendingSeek === null) position.value = currentFrame;
+    updateControls();
     const url = "data:image/jpeg;base64," + args.image;
     if (token !== args.token || photo.getAttribute("src") !== url) {
       ready = false;
@@ -184,17 +252,14 @@ CLICK_FRAME_HTML = r'''<!doctype html>
   });
   photo.addEventListener("load", () => { ready = true; resize(); });
   photo.addEventListener("click", event => {
-    if (!ready || token === null) return;
+    if (!ready || token === null || pendingSeek !== null) return;
     const bounds = photo.getBoundingClientRect();
     if (!bounds.width || !bounds.height) return;
     const unit = value => Math.max(0, Math.min(1, value));
-    send("streamlit:setComponentValue", {
-      dataType: "json",
-      value: {
-        token, id: Date.now().toString(36) + Math.random().toString(36).slice(2),
-        x: unit((event.clientX - bounds.left) / bounds.width),
-        y: unit((event.clientY - bounds.top) / bounds.height)
-      }
+    sendValue({
+      kind: "mark", token, id: eventId(),
+      x: unit((event.clientX - bounds.left) / bounds.width),
+      y: unit((event.clientY - bounds.top) / bounds.height)
     });
   });
   new ResizeObserver(resize).observe(frame);
@@ -405,7 +470,7 @@ def start_job(upload, image_size: int):
     return {
         "id": uuid4().hex, "temp": job_dir, "source": source, "info": info,
         "detections": detections, "image_size": image_size,
-        "corrections": {}, "split": None, "end": None, "export": None, "click": None,
+        "corrections": {}, "split": None, "end": None, "export": None,
         "filename": f"{Path(upload.name).stem}_swingtrace.mp4",
     }
 
@@ -423,6 +488,28 @@ def edit(job, index, point) -> None:
 
 def move_to(key: str, position: int) -> None:
     st.session_state[key] = position
+
+
+def apply_review_event() -> None:
+    job = st.session_state["job"]
+    job_id = job["id"]
+    event = st.session_state.get(f"click_{job_id}")
+    if not isinstance(event, dict) or not isinstance(event.get("id"), str):
+        return
+    job["review_ack"] = event["id"]
+    info = job["info"]
+    frame_key = f"frame_{job_id}"
+    if event.get("kind") == "seek":
+        position = event.get("frame")
+        if type(position) is int and 1 <= position <= info.frames:
+            move_to(frame_key, position)
+        return
+    index = st.session_state.get(frame_key, 1) - 1
+    if event.get("kind") != "mark" or event.get("token") != f"{job_id}:{index}":
+        return
+    x, y = event.get("x"), event.get("y")
+    if all(type(value) in (int, float) and 0 <= value <= 1 for value in (x, y)):
+        edit(job, index, (round(x * (info.width - 1)), round(y * (info.height - 1))))
 
 
 with st.container():
@@ -536,23 +623,31 @@ if all(sample.point is None for sample in path):
     hint = ("高精度モードで再解析するか、" if job.get("image_size", 640) < 896 else "")
     st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
 
+show_trail = st.session_state.get("review_show_trail", True)
+try:
+    jpeg = preview_jpeg(job["source"], render_path, index, show_trail,
+                        split=split, end=end, review_sample=review_sample, style=style)
+except RuntimeError as error:
+    st.error(str(error))
+else:
+    click_frame(
+        image=b64encode(jpeg).decode("ascii"), token=f"{job['id']}:{index}",
+        frame=index + 1, total_frames=info.frames, ack=job.get("review_ack"),
+        aspect=info.width / info.height, key=f"click_{job['id']}", on_change=apply_review_event,
+    )
+
 previous = next((i for i in reversed(suspects) if i < index), None)
 following = next((i for i in suspects if i > index), None)
-nav = st.columns(4)
-for column, label, target in zip(nav, ("前の要確認", "前のコマ", "次のコマ", "次の要確認"),
-                                 (previous, index - 1, index + 1, following)):
-    enabled = target is not None and 0 <= target < info.frames
-    column.button(label, disabled=not enabled, on_click=move_to if enabled else None,
-                  args=(frame_key, target + 1) if enabled else None, width="stretch")
-
-if info.frames > 1:
-    st.slider("コマ番号", 1, info.frames, key=frame_key)
+nav = st.columns(2)
+for column, label, target in zip(nav, ("前の要確認", "次の要確認"), (previous, following)):
+    column.button(label, disabled=target is None, on_click=move_to if target is not None else None,
+                  args=(frame_key, target + 1) if target is not None else None, width="stretch")
 st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[review_sample.source]}"
            + ("（要確認）" if current.suspect else ""))
 st.write("画像上のクラブヘッドの中心をクリックして修正します。描画範囲内で検出が途切れた部分は自動で曲線をつなぎます。")
 
 controls = st.columns(3)
-show_trail = controls[0].checkbox("確認画像に軌道を表示", value=True)
+controls[0].checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
 if controls[1].button("このコマを除外", disabled=current.source == "excluded", width="stretch"):
     edit(job, index, None)
     st.rerun()
@@ -600,25 +695,6 @@ if split is not None:
 if end >= 0:
     seek_controls[1].button("終了点を確認", on_click=move_to,
                             args=(frame_key, end + 1), width="stretch")
-
-try:
-    jpeg = preview_jpeg(job["source"], render_path, index, show_trail,
-                        split=split, end=end, review_sample=review_sample, style=style)
-except RuntimeError as error:
-    st.error(str(error))
-    st.stop()
-
-token = f"{job['id']}:{index}"
-event = click_frame(
-    image=b64encode(jpeg).decode("ascii"), token=token,
-    aspect=info.width / info.height, key=f"click_{job['id']}", default=None,
-)
-if event and event.get("token") == token and event.get("id") != job["click"]:
-    job["click"] = event["id"]
-    x, y = event.get("x"), event.get("y")
-    if isinstance(x, (int, float)) and isinstance(y, (int, float)) and 0 <= x <= 1 and 0 <= y <= 1:
-        edit(job, index, (round(x * (info.width - 1)), round(y * (info.height - 1))))
-        st.rerun()
 
 st.divider()
 st.subheader("軌道付き動画")
