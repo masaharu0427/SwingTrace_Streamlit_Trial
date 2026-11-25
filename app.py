@@ -150,12 +150,11 @@ CLICK_FRAME_HTML = r'''<!doctype html>
 <html lang="ja">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>修正するクラブヘッドの位置</title>
+<title>軌道のプレビュー</title>
 <style>
   html, body { margin: 0; }
   #frame { position: relative; margin: 0 auto; width: 100%; }
-  img { display: block; width: 100%; cursor: crosshair; touch-action: manipulation;
-        user-select: none; border-radius: 7px; }
+  img { display: block; width: 100%; user-select: none; border-radius: 7px; }
   #review-controls { position: absolute; inset: 6px 6px auto; box-sizing: border-box;
                      color: #fff; background: rgba(16, 25, 24, .86); border-radius: 7px;
                      padding: 2px 6px 4px; font: 14px system-ui, sans-serif; }
@@ -196,9 +195,7 @@ CLICK_FRAME_HTML = r'''<!doctype html>
   const previous = document.getElementById("previous");
   const next = document.getElementById("next");
   const moveControls = document.getElementById("move-controls");
-  let token = null;
-  let ready = false;
-  let currentFrame = 1;
+  let currentFrame = null;
   let pendingSeek = null;
   const send = (type, fields = {}) =>
     window.parent.postMessage({ isStreamlitMessage: true, type, ...fields }, "*");
@@ -214,7 +211,7 @@ CLICK_FRAME_HTML = r'''<!doctype html>
     next.disabled = Number(position.value) >= Number(position.max);
   }
   function seek(target) {
-    if (token === null) return;
+    if (currentFrame === null) return;
     position.value = target;
     updateControls();
     if (pendingSeek === null && Number(position.value) === currentFrame) return;
@@ -241,28 +238,14 @@ CLICK_FRAME_HTML = r'''<!doctype html>
     if (pendingSeek === null) position.value = currentFrame;
     updateControls();
     const url = "data:image/jpeg;base64," + args.image;
-    if (token !== args.token || photo.getAttribute("src") !== url) {
-      ready = false;
-      token = args.token;
+    if (photo.getAttribute("src") !== url) {
       frame.style.maxWidth = Math.round(Math.min(960, 720 * args.aspect)) + "px";
       photo.style.aspectRatio = args.aspect;
       photo.src = url;
-      ready = photo.complete && photo.naturalWidth > 0;
     }
     resize();
   });
-  photo.addEventListener("load", () => { ready = true; resize(); });
-  photo.addEventListener("click", event => {
-    if (!ready || token === null || pendingSeek !== null) return;
-    const bounds = photo.getBoundingClientRect();
-    if (!bounds.width || !bounds.height) return;
-    const unit = value => Math.max(0, Math.min(1, value));
-    sendValue({
-      kind: "mark", token, id: eventId(),
-      x: unit((event.clientX - bounds.left) / bounds.width),
-      y: unit((event.clientY - bounds.top) / bounds.height)
-    });
-  });
+  photo.addEventListener("load", resize);
   new ResizeObserver(resize).observe(frame);
   send("streamlit:componentReady", { apiVersion: 1 });
   resize();
@@ -307,7 +290,7 @@ new ResizeObserver(height).observe($('root'));post('streamlit:componentReady',{a
 </script></html>"""
 
 st.title("SwingTrace クラブヘッド追跡")
-st.caption("スイング動画を選択 → 自動追跡 → 外れたコマをクリックで修正 → MP4を保存")
+st.caption("スイング動画を選択 → 自動追跡 → MP4を保存")
 
 STATUS = {
     "head": "AI検出",
@@ -475,7 +458,7 @@ def start_job(upload, image_size: int):
     return {
         "id": uuid4().hex, "temp": job_dir, "source": source, "info": info,
         "detections": detections, "image_size": image_size,
-        "corrections": {}, "split": None, "end": None, "export": None,
+        "split": None, "end": None, "export": None,
         "filename": f"{Path(upload.name).stem}_swingtrace.mp4",
     }
 
@@ -484,11 +467,6 @@ def invalidate_export(job) -> None:
     if job["export"] is not None:
         job["export"].unlink(missing_ok=True)
         job["export"] = None
-
-
-def edit(job, index, point) -> None:
-    job["corrections"][index] = point
-    invalidate_export(job)
 
 
 def move_to(key: str, position: int) -> None:
@@ -504,22 +482,13 @@ def apply_review_event() -> None:
     job = st.session_state["job"]
     job_id = job["id"]
     event = st.session_state.get(f"click_{job_id}")
-    if not isinstance(event, dict) or not isinstance(event.get("id"), str):
+    if not isinstance(event, dict) or event.get("kind") != "seek" or not isinstance(event.get("id"), str):
         return
     job["review_ack"] = event["id"]
-    info = job["info"]
-    frame_key = f"frame_{job_id}"
-    if event.get("kind") == "seek":
-        position = event.get("frame")
-        if type(position) is int and 1 <= position <= info.frames:
-            move_to(frame_key, position)
-        return
-    index = st.session_state.get(frame_key, 1) - 1
-    if event.get("kind") != "mark" or event.get("token") != f"{job_id}:{index}":
-        return
-    x, y = event.get("x"), event.get("y")
-    if all(type(value) in (int, float) and 0 <= value <= 1 for value in (x, y)):
-        edit(job, index, (round(x * (info.width - 1)), round(y * (info.height - 1))))
+    position = event.get("frame")
+    if type(position) is int and 1 <= position <= job["info"].frames:
+        move_to(f"frame_{job_id}", position)
+
 
 
 with st.container():
@@ -584,7 +553,7 @@ if job is None:
     st.stop()
 
 info = job["info"]
-path = estimate_path(job["detections"], job["corrections"], info.fps, info.width, info.height)
+path = estimate_path(job["detections"], job.get("corrections", {}), info.fps, info.width, info.height)
 suggestion = estimate_timing(path, info.fps, info.height)
 if job.get("drawing_scope", "stop") != scope:
     invalidate_export(job)
@@ -614,8 +583,6 @@ render_path = render_trajectory(
 split = job.get("split")
 split = suggestion.split if split is None else split
 split = split if split is not None and split <= end else None
-suspects = [i for i, sample in enumerate(path) if sample.suspect]
-manual_count = sum(sample.source == "manual" for sample in path)
 frame_key = f"frame_{job['id']}"
 index = st.session_state.get(frame_key, 1) - 1
 current = path[index]
@@ -624,8 +591,8 @@ preview_end = end if end >= 0 else last_seen
 preview_path = render_path if end >= 0 else path
 review_sample = preview_path[index] if current.source == "missing" else current
 st.divider()
-st.subheader("コマを確認・修正")
-st.caption(f"{job['filename']} · {info.frames:,}コマ · {info.fps:g} fps · 要確認 {len(suspects):,} · 手動修正 {manual_count:,}")
+st.subheader("軌道のプレビュー")
+st.caption(f"{job['filename']} · {info.frames:,}コマ · {info.fps:g} fps")
 direct = sum(sample.source == "head" for sample in path)
 estimated = sum(sample.source in ("shaft", "interpolated") for sample in path)
 missing = sum(sample.source == "missing" for sample in render_path[:end + 1])
@@ -633,8 +600,8 @@ auto_filled = sum(before.point is None and after.point is not None
                   for before, after in zip(path[:end + 1], render_path[:end + 1]))
 st.caption(f"ヘッド直接検出 {direct:,} · シャフト推定・補間 {estimated:,} · 曲線で補間 {auto_filled:,} · 未検出 {missing:,}")
 if not has_tracking:
-    hint = ("高精度モードで再解析するか、" if job.get("image_size", 640) < 896 else "")
-    st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
+    hint = "高精度モードで再解析してください。" if job.get("image_size", 640) < 896 else ""
+    st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}")
 
 show_trail = st.checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
 if show_trail and end < 0 and has_tracking:
@@ -648,7 +615,7 @@ except RuntimeError as error:
     st.error(str(error))
 else:
     click_frame(
-        image=b64encode(jpeg).decode("ascii"), token=f"{job['id']}:{index}",
+        image=b64encode(jpeg).decode("ascii"),
         frame=index + 1, total_frames=info.frames, ack=job.get("review_ack"),
         aspect=info.width / info.height, key=f"click_{job['id']}", on_change=apply_review_event,
     )
@@ -672,24 +639,7 @@ if st.button("このコマで描画終了", width="stretch"):
     job["auto_export_pending"] = auto_export
     st.rerun()
 
-previous = next((i for i in reversed(suspects) if i < index), None)
-following = next((i for i in suspects if i > index), None)
-nav = st.columns(2)
-for column, label, target in zip(nav, ("前の要確認", "次の要確認"), (previous, following)):
-    column.button(label, disabled=target is None, on_click=move_to if target is not None else None,
-                  args=(frame_key, target + 1) if target is not None else None, width="stretch")
-st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[review_sample.source]}"
-           + ("（要確認）" if current.suspect else ""))
-st.write("画像上のクラブヘッドの中心をクリックして修正します。描画範囲内で検出が途切れた部分は自動で曲線をつなぎます。")
-
-controls = st.columns(2)
-if controls[0].button("このコマを除外", disabled=current.source == "excluded", width="stretch"):
-    edit(job, index, None)
-    st.rerun()
-if controls[1].button("このコマの修正を戻す", disabled=index not in job["corrections"], width="stretch"):
-    del job["corrections"][index]
-    invalidate_export(job)
-    st.rerun()
+st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[review_sample.source]}")
 
 st.subheader("軌道の色と描画範囲")
 if split is None:
