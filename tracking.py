@@ -227,18 +227,16 @@ def estimate_path(
         if previous_pass[i].source != "missing":
             continue
         reference, tip = references[i], detection.shaft_tip
-        adjacent_tips = [detections[j].shaft_tip for j in (i - 1, i + 1)
-                         if 0 <= j < len(path) and previous_pass[j].source != "excluded"]
-        tip_agrees = tip is not None and (
-            (reference is not None and distance(reference, tip) <= 0.15 * diagonal)
-            or any(other is not None and distance(tip, other) <= 0.12 * diagonal
-                   for other in adjacent_tips)
-        )
+        # Consecutive shaft guesses can lock onto the same background line.
+        tip_agrees = i in bracketed and tip is not None and distance(reference, tip) <= 0.045 * diagonal
         candidates = [
             (point, score) for point, score in detection.heads
-            if ((tip_agrees and distance(tip, point) <= 0.08 * diagonal)
-                or (reference is not None and distance(reference, point) <= 0.055 * diagonal))
-            and (reference is None or distance(reference, point) <= 0.18 * diagonal)
+            if reference is not None and (
+                distance(reference, point) <= 0.055 * diagonal
+                or (i in bracketed and score >= 0.18 and tip is not None
+                    and distance(tip, point) <= 0.025 * diagonal
+                    and distance(reference, point) <= 0.12 * diagonal)
+            )
         ]
         if candidates:
             point, _ = max(candidates, key=lambda hit: hit[1])
@@ -249,7 +247,7 @@ def estimate_path(
             corners = [(x, y) for x1, y1, x2, y2 in detection.shafts
                        for x in (x1, x2) for y in (y1, y2)]
             closest = min(corners, key=lambda corner: distance(reference, corner))
-            if distance(reference, closest) <= 0.055 * diagonal:
+            if distance(reference, closest) <= 0.03 * diagonal:
                 path[i] = Sample(clip(closest), "shaft", True)
 
     gap_span = max(1, round(fps * 0.14))

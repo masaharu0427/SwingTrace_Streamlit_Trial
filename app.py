@@ -702,7 +702,7 @@ st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒
            + ("（要確認）" if current.suspect else ""))
 if end >= 0 and index > end:
     st.caption(f"軌道の描画範囲は{end + 1:,}コマ目までです。このコマの検出状態は上に表示しています。")
-st.write("画像上のクラブヘッドの中心をクリックして修正します。描画範囲内で検出が途切れた部分は自動で曲線をつなぎます。")
+st.write("画像上のクラブヘッドの中心をクリックして修正します。位置を絞れない区間は途切れたまま表示します。")
 
 controls = st.columns(2)
 if controls[0].button("このコマを除外", disabled=current.source == "excluded", width="stretch"):
@@ -748,7 +748,7 @@ if end >= 0:
 
 st.divider()
 st.subheader("軌道付き動画")
-st.caption("描画範囲内の未検出区間は前後の動きから推定します。描画終了後も軌道を表示したまま再生します。")
+st.caption("前後の動きから位置を推定できた区間をつなぎます。描画終了後も軌道を表示したまま再生します。")
 if missing:
     st.caption(f"描画範囲内に補間できなかったコマが {missing:,} 枚あります。")
 can_export = end >= 0 and any(p.point is not None for p in render_path[:end + 1])
