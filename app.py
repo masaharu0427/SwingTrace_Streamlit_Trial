@@ -493,6 +493,11 @@ def move_to(key: str, position: int) -> None:
     st.session_state[key] = position
 
 
+def request_follow_export() -> None:
+    st.session_state["drawing_scope"] = "follow"
+    st.session_state["job"]["follow_export_requested"] = True
+
+
 def apply_review_event() -> None:
     job = st.session_state["job"]
     job_id = job["id"]
@@ -612,6 +617,7 @@ manual_count = sum(sample.source == "manual" for sample in path)
 frame_key = f"frame_{job['id']}"
 index = st.session_state.get(frame_key, 1) - 1
 current = path[index]
+has_tracking = any(sample.point is not None for sample in path)
 preview_end = end if end >= 0 else last_seen
 preview_path = render_path if end >= 0 else path
 review_sample = preview_path[index] if current.source == "missing" else current
@@ -624,12 +630,12 @@ missing = sum(sample.source == "missing" for sample in render_path[:end + 1])
 auto_filled = sum(before.point is None and after.point is not None
                   for before, after in zip(path[:end + 1], render_path[:end + 1]))
 st.caption(f"ヘッド直接検出 {direct:,} · シャフト推定・補間 {estimated:,} · 曲線で補間 {auto_filled:,} · 未検出 {missing:,}")
-if all(sample.point is None for sample in path):
+if not has_tracking:
     hint = ("高精度モードで再解析するか、" if job.get("image_size", 640) < 896 else "")
     st.warning(f"クラブヘッドの位置を特定できませんでした。{hint}見えるコマをクリックして位置を追加できます。")
 
 show_trail = st.checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
-if show_trail and end < 0 and any(sample.point is not None for sample in path):
+if show_trail and end < 0 and has_tracking:
     st.caption("描画終了点を設定するまでは、確認画像に検出済みの軌道を表示します。")
 # Keep the line visible when the review image is reduced to phone width.
 preview_style = TrailStyle(style.before, style.after, style.thickness + 4)
@@ -654,6 +660,15 @@ if info.frames > 1:
             "コマ番号", 1, info.frames, key=slider_key,
             on_change=lambda: move_to(frame_key, st.session_state[slider_key]),
         )
+
+if end < 0 and has_tracking:
+    st.info("ヘッドが体に隠れる位置を特定できませんでした。フォローまで補間してMP4を作成するか、プレビューで終了コマを選べます。")
+    st.button("フォローまで補間してMP4を作成", on_click=request_follow_export, width="stretch")
+if st.button("このコマで描画終了", width="stretch"):
+    job[end_key] = index
+    invalidate_export(job)
+    job["auto_export_pending"] = auto_export
+    st.rerun()
 
 previous = next((i for i in reversed(suspects) if i < index), None)
 following = next((i for i in suspects if i > index), None)
@@ -682,24 +697,17 @@ else:
                f"{' ・ 自動候補' if job.get('split') is None else ''}")
 if include_follow and suggestion.occlusion_found and last_seen <= suggestion.end:
     st.caption("ヘッドが再び見えるコマを検出できた場合に、フォローまで描画します。")
-if end < 0:
-    st.warning("ヘッドが隠れる位置を自動で特定できませんでした。コマ番号でヘッドが隠れる直前に移動し、「このコマで描画終了」を押してください。")
-else:
+if end >= 0:
     end_label = " ・ 手動指定" if manual_end is not None else (
         " ・ 最後の検出点" if include_follow else " ・ 隠れる直前の自動候補"
     )
     st.caption(f"描画終了　{end + 1:,}コマ目（{end / info.fps:.2f}秒）{end_label}")
-timing = st.columns(3)
+timing = st.columns(2)
 if timing[0].button("このコマで色を切り替える", disabled=index >= end, width="stretch"):
     job["split"] = index
     invalidate_export(job)
     st.rerun()
-if timing[1].button("このコマで描画終了", width="stretch"):
-    job[end_key] = index
-    invalidate_export(job)
-    job["auto_export_pending"] = auto_export
-    st.rerun()
-if timing[2].button("色と終了を自動に戻す",
+if timing[1].button("色と終了を自動に戻す",
                     disabled=job.get("split") is None and manual_end is None, width="stretch"):
     job["split"] = None
     job[end_key] = None
@@ -722,7 +730,8 @@ if missing:
 can_export = end >= 0 and any(p.point is not None for p in render_path[:end + 1])
 requested = st.button("軌道付きMP4を作成", type="primary", disabled=not can_export)
 auto_requested = can_export and job.pop("auto_export_pending", False)
-if can_export and (auto_requested or requested):
+follow_requested = job.pop("follow_export_requested", False)
+if can_export and (auto_requested or requested or follow_requested):
     target = job["source"].with_name("swingtrace.mp4")
     progress = st.progress(0, text="軌道付き動画を書き出しています…")
     try:
