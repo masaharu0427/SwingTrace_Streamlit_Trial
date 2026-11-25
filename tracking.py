@@ -256,11 +256,28 @@ def estimate_path(
     anchors = [i for i, sample in enumerate(path) if sample.point is not None or sample.source == "excluded"]
     for left, right in zip(anchors, anchors[1:]):
         first, last = path[left].point, path[right].point
-        if first is None or last is None or right - left > gap_span + 1:
+        span = right - left
+        if first is None or last is None or not 1 < span <= gap_span + 1:
             continue
-        if distance(first, last) > diagonal * min(0.34, (right - left) * 0.11):
-            continue
+        if distance(first, last) > diagonal * min(0.34, span * 0.11):
+            # Fast, short gaps can still be joined when both sides show the same motion.
+            before = path[left - 1].point if left > 0 else None
+            after = path[right + 1].point if right + 1 < len(path) else None
+            if (before is None or after is None or path[left].source not in ("head", "manual")
+                    or path[right].source not in ("head", "manual")
+                    or distance(first, last) > 0.43 * diagonal):
+                continue
+            gap_velocity = (np.asarray(last) - first) / span
+            entry_velocity = np.asarray(first) - before
+            exit_velocity = np.asarray(after) - last
+            speed = np.linalg.norm(gap_velocity)
+            if not all(
+                0.45 * speed <= np.linalg.norm(velocity) <= 2.2 * speed
+                and np.dot(velocity, gap_velocity) >= 0.8 * np.linalg.norm(velocity) * speed
+                for velocity in (entry_velocity, exit_velocity)
+            ):
+                continue
         for index in range(left + 1, right):
-            point = interpolate(first, last, (index - left) / (right - left))
+            point = interpolate(first, last, (index - left) / span)
             path[index] = Sample(point, "interpolated", True)
     return path
