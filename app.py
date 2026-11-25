@@ -680,6 +680,8 @@ for column, label, target in zip(nav, ("前の要確認", "次の要確認"), (p
                   args=(frame_key, target + 1) if target is not None else None, width="stretch")
 st.caption(f"{index + 1:,} / {info.frames:,} コマ · {index / info.fps:.3f}秒 · {STATUS[review_sample.source]}"
            + ("（要確認）" if current.suspect else ""))
+if end >= 0 and index > end:
+    st.caption(f"軌道の描画範囲は{end + 1:,}コマ目までです。このコマの検出状態は上に表示しています。")
 st.write("画像上のクラブヘッドの中心をクリックして修正します。描画範囲内で検出が途切れた部分は自動で曲線をつなぎます。")
 
 controls = st.columns(2)

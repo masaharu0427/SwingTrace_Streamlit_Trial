@@ -108,6 +108,8 @@ class Detector:
         if image_size <= 640:
             return base
 
+        # Keep the original detections as anchors so retries cannot propagate a false hit.
+        anchors = [d.head if d.confidence >= 0.50 else None for d in base]
         missing = [i for i, detection in enumerate(base) if detection.confidence < STRONG_HEAD]
         for start in range(0, len(missing), 2):
             indices = missing[start:start + 2]
@@ -116,18 +118,24 @@ class Detector:
                 detected = base[i]
                 tip = secondary.shaft_tip or detected.shaft_tip
                 heads = detected.heads + secondary.heads
-                if tip is not None and max((score for _, score in heads), default=0) < STRONG_HEAD:
+                center = tip
+                if center is None:
+                    before = anchors[i - 1] if i > 0 else None
+                    after = anchors[i + 1] if i + 1 < len(anchors) else None
+                    if before is not None and after is not None:
+                        center = tuple(round((a + b) / 2) for a, b in zip(before, after))
+                if center is not None and max((score for _, score in heads), default=0) < STRONG_HEAD:
                     frame = frames[i]
                     height, width = frame.shape[:2]
                     crop_width = max(1, round(width * 0.52))
                     crop_height = max(1, round(height * 0.52))
-                    x = min(width - crop_width, max(0, tip[0] - crop_width // 2))
-                    y = min(height - crop_height, max(0, tip[1] - crop_height // 2))
+                    x = min(width - crop_width, max(0, center[0] - crop_width // 2))
+                    y = min(height - crop_height, max(0, center[1] - crop_height // 2))
                     crop = frame[y:y + crop_height, x:x + crop_width]
                     zoomed = self.infer([crop], 640, (x, y))[0]
                     radius = 0.10 * float(np.hypot(width, height))
                     heads += tuple((point, score) for point, score in zoomed.heads
-                                   if distance(point, tip) <= radius)
+                                   if distance(point, center) <= radius)
                 base[i] = make_detection(heads, tip, detected.shafts + secondary.shafts)
         return base
 
