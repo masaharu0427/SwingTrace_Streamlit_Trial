@@ -23,15 +23,77 @@ from video_io import (
 st.set_page_config(page_title="SwingTrace クラブヘッド追跡", page_icon="⛳", layout="wide")
 st.markdown("""
 <style>
+:root {
+    color-scheme: dark;
+    --golf-bg: #101c21;
+    --golf-panel: #172a30;
+    --golf-control: #223a42;
+    --golf-border: #41616a;
+    --golf-text: #eff7f6;
+    --golf-muted: #bfd2d4;
+    --golf-accent: #68e5bd;
+}
+/* Keep the dark surfaces even when Streamlit's Light theme is selected. */
+html, body,
+:is([data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    [data-testid="stMainBlockContainer"], [data-testid="stHeader"]) {
+    background-color: var(--golf-bg) !important;
+    color: var(--golf-text) !important;
+}
+[data-testid="stMain"] :is(h1, h2, h3, h4, p, label, summary) {
+    color: var(--golf-text) !important;
+}
+:is([data-testid="stCaptionContainer"], [data-testid="stFileUploaderDropzoneInstructions"])
+    :is(p, small, span) {
+    color: var(--golf-muted) !important;
+}
+:is([data-testid="stFileUploaderDropzone"], [data-testid="stExpander"] details,
+    [data-testid="stExpander"] summary) {
+    background-color: var(--golf-panel) !important;
+    border-color: var(--golf-border) !important;
+    color: var(--golf-text) !important;
+}
+:is([data-testid="stHeader"], [data-testid="stFileUploaderDropzone"],
+    [data-testid="stExpander"] summary) svg {
+    color: var(--golf-muted) !important;
+}
+[data-testid="stMain"] button[kind], [data-testid="stHeader"] button {
+    background-color: var(--golf-control) !important;
+    border-color: var(--golf-border) !important;
+    color: var(--golf-text) !important;
+}
+[data-testid="stMain"] button[kind]:hover:not(:disabled) {
+    border-color: var(--golf-accent) !important;
+}
+[data-testid="stMain"] button[kind="primary"] {
+    background-color: var(--golf-accent) !important;
+    border-color: var(--golf-accent) !important;
+    color: #102821 !important;
+}
+[data-testid="stMain"] button[kind="primary"] :is(p, span) {
+    color: inherit !important;
+}
+[data-testid="stMain"] button[kind="primary"]:hover:not(:disabled) {
+    background-color: #8af0cf !important;
+}
+[data-testid="stMain"] button[kind]:disabled { opacity: .66; }
+[data-testid="stAlert"] [role="alert"],
+[data-testid="stAlert"] [data-baseweb="notification"] {
+    background-color: var(--golf-control) !important;
+}
+[data-testid="stColorPicker"] [data-baseweb="input"] {
+    border-color: var(--golf-border) !important;
+}
+[data-testid="stSlider"] [role="slider"] { background-color: var(--golf-accent) !important; }
 html, [data-testid="stMain"] { scrollbar-width: auto; }
 html::-webkit-scrollbar:vertical,
 [data-testid="stMain"]::-webkit-scrollbar:vertical { width: 22px; }
 html::-webkit-scrollbar-track:vertical,
-[data-testid="stMain"]::-webkit-scrollbar-track:vertical { background: #e8eeec; }
+[data-testid="stMain"]::-webkit-scrollbar-track:vertical { background: #101c21; }
 html::-webkit-scrollbar-thumb:vertical,
 [data-testid="stMain"]::-webkit-scrollbar-thumb:vertical {
-    background: #648478;
-    border: 2px solid #e8eeec;
+    background: #48656c;
+    border: 2px solid #101c21;
     border-radius: 12px;
 }
 @media (pointer: coarse) {
@@ -53,7 +115,7 @@ mobile_scrollbar = st.components.v2.component(
         right: max(3px, env(safe-area-inset-right));
         width: 28px;
         z-index: 10;
-        background: #e8eeec;
+        background: #172a30;
         border-radius: 14px;
         touch-action: none;
         user-select: none;
@@ -63,7 +125,7 @@ mobile_scrollbar = st.components.v2.component(
         position: absolute;
         left: 3px;
         right: 3px;
-        background: #648478;
+        background: #66878e;
         border-radius: 12px;
     }
     """,
@@ -156,18 +218,18 @@ CLICK_FRAME_HTML = r'''<!doctype html>
   #frame { position: relative; margin: 0 auto; width: 100%; }
   img { display: block; width: 100%; user-select: none; border-radius: 7px; }
   #review-controls { position: absolute; inset: 6px 6px auto; box-sizing: border-box;
-                     color: #fff; background: rgba(16, 25, 24, .86); border-radius: 7px;
+                     color: #eff7f6; background: rgba(16, 28, 33, .92); border-radius: 7px;
                      padding: 2px 6px 4px; font: 14px system-ui, sans-serif; }
   #review-controls.bottom { inset: auto 6px 6px; }
   #review-controls[hidden] { display: none; }
   .review-row { display: flex; align-items: center; gap: 6px; }
   .review-status { justify-content: space-between; min-height: 30px; padding-left: 4px; }
-  button { min-width: 44px; min-height: 38px; border: 1px solid #889d94;
-           border-radius: 5px; color: inherit; background: #293c35; font: inherit; cursor: pointer; }
+  button { min-width: 44px; min-height: 38px; border: 1px solid #41616a;
+           border-radius: 5px; color: inherit; background: #223a42; font: inherit; cursor: pointer; }
   button:disabled { opacity: .45; cursor: default; }
   #move-controls { min-height: 30px; border: 0; background: transparent; }
   #position { flex: 1; min-width: 0; margin: 0; height: 38px;
-              accent-color: #9aefc9; cursor: pointer; touch-action: none; }
+              accent-color: #68e5bd; cursor: pointer; touch-action: none; }
   @media (pointer: coarse) {
     button, #position { min-height: 44px; }
   }
@@ -273,7 +335,7 @@ MOBILE_MAX_FPS = 60
 MOBILE_MAX_SIDE = 1920
 
 MOBILE_UPLOAD_HTML = r"""<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
-body{margin:0;font-family:Arial,'Yu Gothic',sans-serif;color:#19382c}*{box-sizing:border-box}.box{padding:12px;background:#f0f4ef;border:1px solid #cbd5c6;border-radius:8px}button{font:inherit;padding:12px;border:1px solid #9caf98;border-radius:6px;background:white;color:#19382c;cursor:pointer;margin:4px 4px 4px 0}button:disabled{opacity:.45;cursor:default}#send{background:#247052;color:white}#name{margin:10px 0;overflow-wrap:anywhere;font-weight:bold}#status{font-size:14px;line-height:1.6;white-space:pre-wrap}progress{width:100%;height:18px}small{display:block;margin:8px 0;color:#52644c;line-height:1.6}
+body{margin:0;font-family:Arial,'Yu Gothic',sans-serif;color:#eff7f6;color-scheme:dark}*{box-sizing:border-box}.box{padding:12px;background:#172a30;border:1px solid #41616a;border-radius:8px}button{font:inherit;padding:12px;border:1px solid #41616a;border-radius:6px;background:#223a42;color:#eff7f6;cursor:pointer;margin:4px 4px 4px 0}button:disabled{opacity:.45;cursor:default}#send{background:#68e5bd;color:#102821}#name{margin:10px 0;overflow-wrap:anywhere;font-weight:bold}#status{font-size:14px;line-height:1.6;white-space:pre-wrap}progress{width:100%;height:18px;accent-color:#68e5bd}small{display:block;margin:8px 0;color:#bfd2d4;line-height:1.6}
 </style><div class="box" id="root"><button id="choose">① ファイルから__MEDIA__を選ぶ</button><button id="gallery">__GALLERY__</button><input type="file" id="files" hidden><input type="file" id="videos" accept="__ACCEPT__" hidden><div id="name">__MEDIA__はまだ選ばれていません</div><button id="send" disabled>② __MEDIA__を送信</button><progress id="progress" value="0" max="100"></progress><div id="status" role="status">端末内に保存した__MEDIA__を選んでください（__LIMIT__MBまで）</div><small>__MEDIA__名が出たら「② __MEDIA__を送信」を押してください__AFTER_SEND__</small></div><script>
 const $=id=>document.getElementById(id);let file=null,busy=false,args={},pending=null,picker=false;
 function post(type,extra={}){window.parent.postMessage({isStreamlitMessage:true,type,...extra},'*');}
