@@ -16,7 +16,7 @@ import streamlit.components.v1 as components
 from tracking import Detector, estimate_path
 from trajectory import estimate_timing, render_trajectory
 from video_io import (
-    DEFAULT_TRAIL_STYLE, MAX_FRAMES, MAX_SECONDS, TrailStyle,
+    DEFAULT_TRAIL_STYLE, MAX_FRAMES, MAX_SECONDS, SHAFT_EXTENSION, ShaftPlane, TrailStyle,
     VideoInfo, analyze, export_video, normalize, open_video, preview_jpeg, run_ffmpeg,
 )
 
@@ -217,6 +217,16 @@ CLICK_FRAME_HTML = r'''<!doctype html>
   html, body { margin: 0; }
   #frame { position: relative; margin: 0 auto; width: 100%; }
   img { display: block; width: 100%; user-select: none; border-radius: 7px; }
+  #shaft-editor { position: absolute; inset: 0; overflow: hidden; pointer-events: none; touch-action: none; }
+  #shaft-editor svg { display: block; width: 100%; height: 100%; }
+  #shaft-line { stroke: white; stroke-width: 2; }
+  #shaft-hit { stroke: transparent; stroke-width: 26; pointer-events: stroke; }
+  #shaft-hit, .shaft-handle { touch-action: none; cursor: grab; }
+  .shaft-handle { position: absolute; width: 40px; height: 40px;
+                  transform: translate(-50%, -50%); pointer-events: auto; }
+  .shaft-handle::after { content: ""; position: absolute; inset: 12px; border-radius: 50%;
+                         border: 2px solid #163c30; background: #58d6ef; }
+  .shaft-handle[data-point="1"]::after { background: #e9f38a; }
   #review-controls { position: absolute; inset: 6px 6px auto; box-sizing: border-box;
                      color: #eff7f6; background: rgba(16, 28, 33, .92); border-radius: 7px;
                      padding: 2px 6px 4px; font: 14px system-ui, sans-serif; }
@@ -236,6 +246,11 @@ CLICK_FRAME_HTML = r'''<!doctype html>
 </style>
 <div id="frame">
   <img id="photo" alt="スイング動画の確認コマ" draggable="false">
+  <div id="shaft-editor" hidden>
+    <svg aria-hidden="true"><line id="shaft-line"></line><line id="shaft-hit"></line></svg>
+    <span class="shaft-handle" data-point="0" title="ヘッド側の調整点"></span>
+    <span class="shaft-handle" data-point="1" title="グリップ側の調整点"></span>
+  </div>
   <div id="review-controls" role="group" aria-label="コマの移動" hidden>
     <div class="review-row review-status">
       <span id="frame-number"></span>
@@ -257,8 +272,16 @@ CLICK_FRAME_HTML = r'''<!doctype html>
   const previous = document.getElementById("previous");
   const next = document.getElementById("next");
   const moveControls = document.getElementById("move-controls");
+  const shaftEditor = document.getElementById("shaft-editor");
+  const shaftLine = document.getElementById("shaft-line");
+  const shaftHit = document.getElementById("shaft-hit");
+  const shaftHandles = [...shaftEditor.querySelectorAll(".shaft-handle")];
   let currentFrame = null;
   let pendingSeek = null;
+  let shaftPoints = null;
+  let shaftExtension = null;
+  let shaftDrag = null;
+  let pendingShaft = null;
   const send = (type, fields = {}) =>
     window.parent.postMessage({ isStreamlitMessage: true, type, ...fields }, "*");
   const sendValue = (value) =>
@@ -267,13 +290,72 @@ CLICK_FRAME_HTML = r'''<!doctype html>
   const resize = () => send("streamlit:setFrameHeight", {
     height: Math.ceil(frame.getBoundingClientRect().height) + 1
   });
+  const clamp = (value, min = 0, max = 1) => Math.max(min, Math.min(max, value));
+  const percent = (value) => (value * 100) + "%";
+
+  function drawShaft() {
+    const [a, b] = shaftPoints;
+    for (const line of [shaftLine, shaftHit]) {
+      line.setAttribute("x1", percent(a[0]));
+      line.setAttribute("y1", percent(a[1]));
+      line.setAttribute("x2", percent(a[0] + (b[0] - a[0]) * shaftExtension));
+      line.setAttribute("y2", percent(a[1] + (b[1] - a[1]) * shaftExtension));
+    }
+    shaftHandles.forEach((handle, i) => {
+      handle.style.left = percent(shaftPoints[i][0]);
+      handle.style.top = percent(shaftPoints[i][1]);
+    });
+  }
+
+  function shaftPosition(event) {
+    const bounds = photo.getBoundingClientRect();
+    return [(event.clientX - bounds.left) / bounds.width,
+            (event.clientY - bounds.top) / bounds.height];
+  }
+
+  shaftEditor.addEventListener("pointerdown", (event) => {
+    const target = event.target;
+    if (event.button !== 0 || shaftDrag || pendingSeek || pendingShaft || !shaftPoints ||
+        (target !== shaftHit && !shaftHandles.includes(target))) return;
+    shaftDrag = { id: event.pointerId, frame: currentFrame, start: shaftPosition(event),
+                  point: target === shaftHit ? null : Number(target.dataset.point), original: shaftPoints };
+    target.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  shaftEditor.addEventListener("pointermove", (event) => {
+    if (shaftDrag?.id !== event.pointerId) return;
+    const { original, point, start } = shaftDrag;
+    const delta = shaftPosition(event).map((value, i) => value - start[i]);
+    if (point === null) {
+      const limits = delta.map((value, i) => clamp(value, -Math.min(original[0][i], original[1][i]),
+                                                       1 - Math.max(original[0][i], original[1][i])));
+      shaftPoints = original.map(p => p.map((value, i) => value + limits[i]));
+    } else {
+      shaftPoints = original.map((p, j) => j === point ? p.map((value, i) => clamp(value + delta[i])) : p);
+    }
+    drawShaft();
+  });
+  shaftEditor.addEventListener("pointerup", (event) => {
+    if (shaftDrag?.id !== event.pointerId) return;
+    const { frame: editedFrame, original } = shaftDrag;
+    shaftDrag = null;
+    if (original.every((point, i) => point.every((value, j) => value === shaftPoints[i][j]))) return;
+    pendingShaft = eventId();
+    sendValue({ kind: "shaft", id: pendingShaft, frame: editedFrame, points: shaftPoints });
+  });
+  shaftEditor.addEventListener("lostpointercapture", (event) => {
+    if (shaftDrag?.id !== event.pointerId) return;
+    shaftPoints = shaftDrag.original;
+    shaftDrag = null;
+    drawShaft();
+  });
   function updateControls() {
     number.textContent = position.value + " / " + position.max + " コマ";
     previous.disabled = Number(position.value) <= 1;
     next.disabled = Number(position.value) >= Number(position.max);
   }
   function seek(target) {
-    if (currentFrame === null) return;
+    if (currentFrame === null || shaftDrag || pendingShaft) return;
     position.value = target;
     updateControls();
     if (pendingSeek === null && Number(position.value) === currentFrame) return;
@@ -299,6 +381,15 @@ CLICK_FRAME_HTML = r'''<!doctype html>
     if (args.ack === pendingSeek) pendingSeek = null;
     if (pendingSeek === null) position.value = currentFrame;
     updateControls();
+    if (args.ack === pendingShaft) pendingShaft = null;
+    if (!args.shaft_points) {
+      shaftDrag = null;
+      pendingShaft = null;
+    }
+    if (!shaftDrag && !pendingShaft) shaftPoints = args.shaft_points;
+    shaftExtension = args.shaft_extension;
+    shaftEditor.hidden = !shaftPoints;
+    if (shaftPoints) drawShaft();
     const url = "data:image/jpeg;base64," + args.image;
     if (photo.getAttribute("src") !== url) {
       frame.style.maxWidth = Math.round(Math.min(960, 720 * args.aspect)) + "px";
@@ -328,6 +419,7 @@ review_version = sha256(CLICK_FRAME_HTML.encode("utf-8")).hexdigest()[:12]
 click_frame = components.declare_component(
     f"swingtrace_click_frame_{review_version}", path=click_frame_assets(CLICK_FRAME_HTML).name
 )
+DEFAULT_SHAFT_POINTS = ((.70, .85), (.52, .52))
 MAX_UPLOAD_MB = 200
 MOBILE_CHUNK_BYTES = 256 * 1024
 MOBILE_MAX_SECONDS = 60
@@ -540,16 +632,45 @@ def request_follow_export() -> None:
     st.session_state["job"]["follow_export_requested"] = True
 
 
+def change_shaft_plane(job, start: int | None = None) -> None:
+    if start is not None:
+        job["shaft_start"] = start
+    if job["export"] is not None:
+        invalidate_export(job)
+        job["shaft_changed"] = True
+
+
 def apply_review_event() -> None:
     job = st.session_state["job"]
     job_id = job["id"]
     event = st.session_state.get(f"click_{job_id}")
-    if not isinstance(event, dict) or event.get("kind") != "seek" or not isinstance(event.get("id"), str):
+    if not isinstance(event, dict) or not isinstance(event.get("id"), str):
+        return
+    kind = event.get("kind")
+    if kind not in ("seek", "shaft"):
         return
     job["review_ack"] = event["id"]
     position = event.get("frame")
-    if type(position) is int and 1 <= position <= job["info"].frames:
+    if type(position) is not int or not 1 <= position <= job["info"].frames:
+        return
+    if kind == "seek":
         move_to(f"frame_{job_id}", position)
+        return
+    if (not st.session_state.get(f"shaft_enabled_{job_id}") or
+            position != job.get("shaft_start", 0) + 1 or
+            position != st.session_state.get(f"frame_{job_id}", 1)):
+        return
+    points = event.get("points")
+    if not isinstance(points, list) or len(points) != 2 or not all(
+        isinstance(point, list) and len(point) == 2 and
+        all(type(value) in (int, float) and 0 <= value <= 1 for value in point)
+        for point in points
+    ):
+        return
+    updated = (tuple(points[0]), tuple(points[1]))
+    if updated != job.get("shaft_points", DEFAULT_SHAFT_POINTS):
+        job["shaft_points"] = updated
+        change_shaft_plane(job)
 
 
 
@@ -605,6 +726,7 @@ with st.container():
             if loaded is not None:
                 loaded["temp"].cleanup()
                 st.session_state.pop(f"frame_{loaded['id']}", None)
+                st.session_state.pop(f"shaft_enabled_{loaded['id']}", None)
             new_job["auto_export_pending"] = auto_export
             new_job["drawing_scope"] = scope
             new_job["trail_style"] = style_key
@@ -668,17 +790,33 @@ if not has_tracking:
 show_trail = st.checkbox("確認画像に軌道を表示", value=True, key="review_show_trail")
 if show_trail and end < 0 and has_tracking:
     st.caption("描画終了点を設定するまでは、確認画像に検出済みの軌道を表示します。")
+shaft_enabled = st.checkbox("シャフトプレーンを表示（P1〜最後）", key=f"shaft_enabled_{job['id']}",
+                            on_change=change_shaft_plane, args=(job,))
+shaft_plane = None
+edit_shaft = False
+if shaft_enabled:
+    shaft_start = job.get("shaft_start", 0)
+    shaft_plane = ShaftPlane(shaft_start, job.get("shaft_points", DEFAULT_SHAFT_POINTS))
+    edit_shaft = index == shaft_start
+    p1_controls = st.columns(2)
+    p1_controls[0].button("このコマをP1に設定", disabled=edit_shaft, width="stretch",
+                          on_click=change_shaft_plane, args=(job, index))
+    p1_controls[1].button("P1へ移動", disabled=edit_shaft, width="stretch",
+                          on_click=move_to, args=(frame_key, shaft_start + 1))
+    st.caption(f"P1は {shaft_start + 1:,} コマ目。P1のプレビューで、2つの丸または白い線をドラッグして調整します。")
 # Keep the line visible when the review image is reduced to phone width.
 preview_style = TrailStyle(style.before, style.after, style.thickness + 4)
 try:
     jpeg = preview_jpeg(job["source"], preview_path, index, show_trail,
-                        split=split, end=preview_end, review_sample=review_sample, style=preview_style)
+                        split=split, end=preview_end, review_sample=review_sample, style=preview_style,
+                        shaft_plane=None if edit_shaft else shaft_plane)
 except RuntimeError as error:
     st.error(str(error))
 else:
     click_frame(
         image=b64encode(jpeg).decode("ascii"),
         frame=index + 1, total_frames=info.frames, ack=job.get("review_ack"),
+        shaft_points=shaft_plane.points if edit_shaft else None, shaft_extension=SHAFT_EXTENSION,
         aspect=info.width / info.height, key=f"click_{job['id']}", on_change=apply_review_event,
     )
 
@@ -752,16 +890,19 @@ if can_export and (auto_requested or requested or follow_requested):
         export_video(
             job["source"], info, render_path, target,
             lambda done, total: progress.progress(done / total, text=f"MP4作成中 · {done:,} / {total:,} コマ"),
-            split=split, end=end, style=style,
+            split=split, end=end, style=style, shaft_plane=shaft_plane,
         )
         job["export"] = target
         job.pop("style_changed", None)
+        job.pop("shaft_changed", None)
     except Exception as error:
         st.error(f"MP4を作成できませんでした。{error}")
     finally:
         progress.empty()
 if job.get("style_changed") and job["export"] is None:
     st.caption("現在の色と太さで保存するには「軌道付きMP4を作成」を押してください。")
+if job.get("shaft_changed") and job["export"] is None:
+    st.caption("シャフトプレーンの設定を保存動画に反映するには「軌道付きMP4を作成」を押してください。")
 if job["export"] is not None:
     st.video(str(job["export"]), format="video/mp4")
     with job["export"].open("rb") as finished:

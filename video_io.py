@@ -33,6 +33,23 @@ class TrailStyle:
 
 
 DEFAULT_TRAIL_STYLE = TrailStyle()
+SHAFT_EXTENSION = 2.2
+
+
+@dataclass(frozen=True)
+class ShaftPlane:
+    start: int
+    points: tuple[tuple[float, float], tuple[float, float]]
+
+    def draw(self, frame: np.ndarray, index: int) -> None:
+        if index < self.start:
+            return
+        height, width = frame.shape[:2]
+        (ax, ay), (bx, by) = self.points
+        first = (round(ax * (width - 1)), round(ay * (height - 1)))
+        last = (round((ax + (bx - ax) * SHAFT_EXTENSION) * (width - 1)),
+                round((ay + (by - ay) * SHAFT_EXTENSION) * (height - 1)))
+        cv2.line(frame, first, last, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 @dataclass(frozen=True)
@@ -150,8 +167,10 @@ class Trail:
 
 def preview_jpeg(source: Path, path: list[Sample], index: int, show_trail: bool,
                  *, split: int | None, end: int, review_sample: Sample,
-                 style: TrailStyle = DEFAULT_TRAIL_STYLE) -> bytes:
+                 style: TrailStyle = DEFAULT_TRAIL_STYLE, shaft_plane: ShaftPlane | None = None) -> bytes:
     frame = read_frame(source, index)
+    if shaft_plane is not None:
+        shaft_plane.draw(frame, index)
     height, width = frame.shape[:2]
     trail = Trail(path, width, height, split, end, style)
     if show_trail:
@@ -169,7 +188,8 @@ def preview_jpeg(source: Path, path: list[Sample], index: int, show_trail: bool,
 
 
 def export_video(source: Path, info: VideoInfo, path: list[Sample], target: Path, progress,
-                 *, split: int | None, end: int, style: TrailStyle = DEFAULT_TRAIL_STYLE) -> None:
+                 *, split: int | None, end: int, style: TrailStyle = DEFAULT_TRAIL_STYLE,
+                 shaft_plane: ShaftPlane | None = None) -> None:
     if len(path) != info.frames or not any(sample.point is not None for sample in path[:end + 1]):
         raise RuntimeError("保存できる軌道がありません。")
     trail = Trail(path, info.width, info.height, split, end, style)
@@ -190,6 +210,8 @@ def export_video(source: Path, info: VideoInfo, path: list[Sample], target: Path
                         ok, frame = capture.read()
                         if not ok:
                             raise RuntimeError("出力中に動画のコマを読み取れませんでした。")
+                        if shaft_plane is not None:
+                            shaft_plane.draw(frame, index)
                         trail.extend(index)
                         trail.composite(frame, sample, index)
                         encoder.stdin.write(frame.tobytes())
